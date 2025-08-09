@@ -112,12 +112,18 @@ async def build_matrix(
 
                 mid = (bid + ask) / 2.0
                 threshold = 0.5 * ask
+                spread = max(ask - bid, 0.0)
                 if bid >= threshold:
                     price_used = mid; method = "midpoint"
-                elif threshold <= last <= ask:
+                elif (threshold <= last <= ask) and (last >= bid):
                     price_used = last; method = "last_close"
                 else:
-                    price_used = ask * 0.8; method = "ask_minus_20%"
+                    # Conservative fallback: 20% into the spread from bid
+                    # This is more conservative for premium received when selling
+                    price_used = bid + 0.2 * spread
+                    # Clamp to [bid, ask] to avoid anomalies
+                    price_used = min(max(price_used, bid), ask)
+                    method = "bid_plus_20%_spread"
 
                 # Metrics based solely on price_used
                 actual_yield = (price_used / K) * 100.0 if K>0 else 0.0
