@@ -1,0 +1,22 @@
+# config.toml
+
+# Default watch‑list
+TICKERS = ["SPY","MSTR","IBIT","TSLA","NVDA","RGTI"]
+
+# DTE window filter
+MIN_DTE = 2
+MAX_DTE = 67
+
+# Delta targeting
+TARGET_DELTA = 0.30
+DELTA_MIN   = 0.1
+DELTA_MAX   = 0.35
+
+# Strikes either side of pivot
+BAND_STRIKES = 5
+
+# Alert threshold (% 30‑day yield)
+MIN_ALERT_YIELD = 5
+
+# Annual risk‑free rate used in the Black–Scholes POP calc
+RISK_FREE_RATE = 0.0428

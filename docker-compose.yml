@@ -1,0 +1,8 @@
+services:
+  app:
+    build: .
+    volumes:
+      - .:/app        # live‑mount host dir
+    ports:
+      - "8501:8501"
+    restart: unless-stopped

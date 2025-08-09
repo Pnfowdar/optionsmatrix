@@ -1,0 +1,33 @@
+# .dockerignore
+
+# Ignore Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore virtual environment folders
+.venv/
+venv/
+env/
+ENV/
+VENV/
+
+# Ignore Git files
+.git/
+.gitignore
+
+# Ignore IDE/Editor config
+.vscode/
+.idea/
+
+# Ignore Docker files themselves if not needed inside image
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Ignore local data/temp files (add specific ones as needed)
+valid_tickers.json
+watchlist.json
+# *.log
+# *.db
