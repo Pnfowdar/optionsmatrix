@@ -129,6 +129,19 @@ async def build_matrix(
                 actual_yield = (price_used / K) * 100.0 if K>0 else 0.0
                 monthly_yield = actual_yield * (30.0 / dte) if dte>0 else 0.0
                 premium = price_used * 100.0
+                # Additional metrics
+                collateral = K * 100.0
+                max_loss = max(collateral - premium, 0.0)
+                breakeven = K - price_used if side=='put' else K + price_used
+                breakeven_pct = 0.0
+                try:
+                    if spot_price > 0:
+                        # Cushion from spot to breakeven for puts is (spot - BE)/spot
+                        # For calls it's (BE - spot)/spot
+                        diff = (spot_price - breakeven) if side=='put' else (breakeven - spot_price)
+                        breakeven_pct = (diff / spot_price) * 100.0
+                except Exception:
+                    breakeven_pct = 0.0
 
                 # POP calculation
                 pop = 0.0
@@ -149,6 +162,10 @@ async def build_matrix(
                     'monthly_yield': round(monthly_yield,2),
                     'actual_yield': round(actual_yield,2),
                     'premium_dollars': round(premium,2),
+                    'collateral': round(collateral,2),
+                    'max_loss': round(max_loss,2),
+                    'breakeven': round(breakeven,2),
+                    'breakeven_pct': round(breakeven_pct,2),
                     'iv': round(iv_val*100,1),
                     'bid': round(bid,2),
                     'mid': round(mid,2),

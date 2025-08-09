@@ -1,6 +1,7 @@
 # app.py
 import streamlit as st
 import toml
+import math
 import asyncio
 import json
 import pandas as pd
@@ -73,71 +74,34 @@ def load_watchlist() -> list[str]:
     if WATCHFILE.exists():
         try:
             data = json.loads(WATCHFILE.read_text(encoding="utf-8"))
-            if isinstance(data, list) and all(isinstance(t, str) for t in data):
-                print(f"DEBUG [load_watchlist] SUCCESS: Loaded {len(data)} tickers from file.")
-                return data
-            else:
-                st.warning(f"{WATCHFILE} has invalid format. Reverting to defaults.")
-                print(f"WARN [load_watchlist] Invalid format in file. Saving defaults.")
-                save_watchlist(defaults)
-                return defaults
-        except json.JSONDecodeError as e:
-            st.error(f"Error decoding watchlist file: {e}. Using defaults.")
-            print(f"ERROR [load_watchlist] JSON decode error: {e}")
-            return defaults
-        except Exception as e:
-            st.error(f"Error loading watchlist from {WATCHFILE}: {e}. Using defaults.")
-            print(f"ERROR [load_watchlist] General load error: {e}")
-            return defaults
-    else:
-        print(f"DEBUG [load_watchlist] {WATCHFILE} not found. Creating with defaults: {defaults}")
-        save_watchlist(defaults)
-        return defaults
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+    return []
 
+def save_watchlist(tickers: list[str]) -> bool:
+    """Persist watchlist to Supabase if available, otherwise to local file.
 
-def save_watchlist(ticker_list: list[str]):
-    """Save watchlist to Supabase if available and mirror to local JSON.
-
-    Shows user-friendly errors if both writes fail.
+    Returns True on success, False otherwise.
     """
-    # Normalize list
-    unique_tickers = sorted(list(set(filter(None, map(str.strip, ticker_list)))))
-
-    # Try Supabase write first (non-fatal if it fails)
-    supabase_ok = False
+    # Normalize symbols
+    safe_list = [s.strip().upper() for s in tickers if isinstance(s, str) and s.strip()]
     if supabase_available():
         try:
-            supabase_ok = save_watchlist_supabase(unique_tickers)
-            if supabase_ok:
-                print(f"DEBUG [save_watchlist] Upserted {len(unique_tickers)} tickers to Supabase")
+            ok = save_watchlist_supabase(safe_list)
+            print(f"DEBUG [save_watchlist] Saved {len(safe_list)} to Supabase: {ok}")
+            return bool(ok)
         except Exception as e:
-            print(f"WARN [save_watchlist] Supabase save failed: {e}")
-
-    # Always mirror to local file for safety
-    file_ok = False
+            print(f"WARN [save_watchlist] Supabase save failed, falling back to file: {e}")
     try:
-        WATCHFILE.write_text(json.dumps(unique_tickers, indent=2), encoding="utf-8")
-        file_ok = True
-        print(f"DEBUG [save_watchlist] Saved {len(unique_tickers)} tickers to {WATCHFILE}")
-    except (IOError, OSError) as e:
-        st.error(f"CRITICAL: Could not write watchlist file '{WATCHFILE}'. Error: {e}")
-        print(f"ERROR [save_watchlist] File write failed (IO/OS): {e}")
+        WATCHFILE.write_text(json.dumps(safe_list, indent=2), encoding="utf-8")
+        print(f"DEBUG [save_watchlist] Saved {len(safe_list)} to {WATCHFILE}")
+        return True
     except Exception as e:
-        st.error(f"Error saving watchlist locally: {e}")
-        print(f"ERROR [save_watchlist] Unexpected save error: {e}")
+        print(f"ERROR [save_watchlist] Failed writing {WATCHFILE}: {e}")
+        return False
 
-    if not (supabase_ok or file_ok):
-        st.error("Failed to save watchlist to both Supabase and local file. Please check logs.")
-
-# --- Ticker Validation ---
-@st.cache_resource(ttl=3600)
-def load_valid_tickers() -> set:
-    """Loads valid ticker set from JSON (cached)."""
-    if VALID_TICKERS_FILE.exists():
-        try: data = json.loads(VALID_TICKERS_FILE.read_text(encoding="utf-8")); return set(data) if isinstance(data, list) else set()
-        except Exception: return set()
-    return set()
-
+# --- Data Fetching ---
 async def fetch_and_save_tickers():
     """Downloads and saves Nasdaq ticker list."""
     st.toast("Updating Nasdaq ticker list...")
@@ -210,7 +174,7 @@ def _process_and_validate_df(rows: list, sym: str) -> pd.DataFrame:
     try:
         df = pd.DataFrame(rows);
         if df.empty: return pd.DataFrame()
-        num_cols = ['strike','delta','POP','monthly_yield','actual_yield','premium_dollars','iv','bid','mid','ask','last','Price Used','dte']
+        num_cols = ['strike','delta','POP','monthly_yield','actual_yield','premium_dollars','collateral','max_loss','breakeven','breakeven_pct','iv','bid','mid','ask','last','Price Used','dte']
         for col in num_cols:
             if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
         if 'expiry' in df.columns: df['expiry_date_obj'] = pd.to_datetime(df['expiry'], errors='coerce')
@@ -219,6 +183,31 @@ def _process_and_validate_df(rows: list, sym: str) -> pd.DataFrame:
         df.fillna({'last': 0.0}, inplace=True)
         return df
     except Exception as e: print(f"ERROR [_process_df] for {sym}: {e}"); st.warning(f"Processing error for {sym}."); return pd.DataFrame()
+
+# --- Formatting Helpers ---
+def fmt_number(val: float) -> str:
+    try:
+        if val is None or pd.isna(val):
+            return "-"
+        return f"{val:,.0f}" if abs(val) >= 1000 else f"{val:,.2f}"
+    except Exception:
+        return "-"
+
+def fmt_currency(val: float) -> str:
+    try:
+        if val is None or pd.isna(val):
+            return "-"
+        return f"${val:,.0f}" if abs(val) >= 1000 else f"${val:,.2f}"
+    except Exception:
+        return "-"
+
+def fmt_percent(val: float) -> str:
+    try:
+        if val is None or pd.isna(val):
+            return "-"
+        return f"{val:,.0f}%" if abs(val) >= 1000 else f"{val:,.2f}%"
+    except Exception:
+        return "-"
 
 # --- Helper Function _update_df_with_live_quotes REMOVED ---
 # (No longer needed as we replace the whole DataFrame)
@@ -277,12 +266,49 @@ async def render(sym: str, box: st.container, price_trigger: float, options_trig
     try: # Filter the current df_processed
         pop_min=st.session_state.pop_slider_value; delta_min, delta_max=st.session_state.delta_slider_value; yield_min=st.session_state.yield_slider_value; dte_min=st.session_state.min_dte_value; dte_max=st.session_state.max_dte_value
         df_filtered = df_processed[ (df_processed["POP"] >= pop_min) & (df_processed["delta"].between(delta_min, delta_max)) & (df_processed["monthly_yield"] >= yield_min) & (df_processed["dte"].between(dte_min, dte_max)) ].copy()
+        # Compute contracts based on portfolio sizing
+        limit = max(st.session_state.portfolio_value_usd * (st.session_state.sizing_percent/100.0), 0.0)
+        per_col = "collateral" if st.session_state.sizing_mode == "Max collateral %" else "max_loss"
+        if per_col in df_filtered.columns:
+            per_vals = df_filtered[per_col].replace(0, pd.NA)
+            raw = limit / per_vals
+            if st.session_state.rounding_mode == "Floor":
+                df_filtered["contracts_max"] = raw.apply(lambda x: max(int(math.floor(x)) if pd.notna(x) else 0, 0))
+            elif st.session_state.rounding_mode == "Ceil":
+                df_filtered["contracts_max"] = raw.apply(lambda x: max(int(math.ceil(x)) if pd.notna(x) else 0, 0))
+            else:
+                df_filtered["contracts_max"] = raw.apply(lambda x: max(int(round(x)) if pd.notna(x) else 0, 0))
+        else:
+            df_filtered["contracts_max"] = 0
+        # Totals based on contracts_max
+        try:
+            df_filtered["total_premium"] = (df_filtered.get("premium_dollars", 0).fillna(0) * df_filtered.get("contracts_max", 0).fillna(0))
+            df_filtered["total_collateral"] = (df_filtered.get("collateral", 0).fillna(0) * df_filtered.get("contracts_max", 0).fillna(0))
+            df_filtered["total_max_loss"] = (df_filtered.get("max_loss", 0).fillna(0) * df_filtered.get("contracts_max", 0).fillna(0))
+        except Exception:
+            df_filtered["total_premium"] = 0.0
+            df_filtered["total_collateral"] = 0.0
+            df_filtered["total_max_loss"] = 0.0
     except Exception as e: box.error(f"Filter error: {e}"); return
     if df_filtered.empty: box.warning("No contracts match filters."); return
 
     # --- Pivot Tables and Score Matrix ---
     try: # Pivot and score logic remains the same
-        col_map={"Monthly Yield %":"monthly_yield","Actual Yield %":"actual_yield","Δ":"delta","POP":"POP","Premium ($)":"premium_dollars"}
+        col_map={
+            "Monthly Yield %":"monthly_yield",
+            "Actual Yield %":"actual_yield",
+            "Δ":"delta",
+            "POP":"POP",
+            "Premium ($)":"premium_dollars",
+            "Contracts (max)":"contracts_max",
+            "Collateral ($)":"collateral",
+            "Max Loss ($)":"max_loss",
+            "Breakeven ($)":"breakeven",
+            "Breakeven (%)":"breakeven_pct",
+            "Total Premium ($)":"total_premium",
+            "Total Collateral ($)":"total_collateral",
+            "Total Max Loss ($)":"total_max_loss"
+        }
         value_col=col_map.get(st.session_state.display_mode_value,"monthly_yield");
         if value_col not in df_filtered.columns: box.error(f"Display col '{value_col}' missing."); return
         disp_pivot=pd.pivot_table(df_filtered,index="expiry",columns="strike",values=value_col,aggfunc='mean')
@@ -310,11 +336,20 @@ async def render(sym: str, box: st.container, price_trigger: float, options_trig
     except Exception as e: box.error(f"Multi-index error: {e}"); mi=None
 
     # --- Style and Display Matrix ---
-    try: # Styling logic remains the same
-        fmt_map={"monthly_yield":"{:.2f}%","actual_yield":"{:.2f}%","delta":"{:.2f}","POP":"{:.1f}%","premium_dollars":"${:.2f}"}
-        fmt_filter=fmt_map.get(value_col,"{:.2f}")
+    try: # Styling logic using helper formatters
+        def _formatter_for(col_key: str):
+            if col_key in ("monthly_yield","actual_yield","breakeven_pct","POP"):
+                return lambda v: fmt_percent(v)
+            if col_key in ("premium_dollars","collateral","max_loss","breakeven","total_premium","total_collateral","total_max_loss"):
+                return lambda v: fmt_currency(v)
+            if col_key in ("contracts_max",):
+                return lambda v: fmt_number(v)
+            if col_key in ("delta",):
+                return lambda v: f"{v:,.2f}" if pd.notna(v) else "-"
+            return lambda v: fmt_number(v)
+        fmt_filter=_formatter_for(value_col)
         score_aligned=score_matrix.reindex(index=disp_pivot.index, columns=disp_pivot.columns).fillna(0.0) if not score_matrix.empty else pd.DataFrame(0.0,index=disp_pivot.index,columns=disp_pivot.columns)
-        styled=disp_pivot.style.format(fmt_filter,na_rep="-",precision=2)
+        styled=disp_pivot.style.format(fmt_filter,na_rep="-")
         if not score_aligned.empty and not (score_aligned==0).all().all():
             try: styled=styled.background_gradient(cmap="RdYlGn",gmap=score_aligned.astype(float),axis=None)
             except Exception as bg_err: box.warning(f"Gradient failed: {bg_err}")
@@ -328,18 +363,92 @@ async def render(sym: str, box: st.container, price_trigger: float, options_trig
         box.markdown("---"); box.markdown("#### Inspector")
         if df_filtered.empty: box.info("No filtered data for inspection."); return
         sub_inspect=df_filtered.copy(); mode=box.radio("Inspect by",["Expiry","Strike"],horizontal=True,index=0,key=f"inspect_mode_{sym}")
+        layout = box.radio("Layout", ["Compact","Wide"], horizontal=True, index=0, key=f"inspect_layout_{sym}")
         if mode=="Expiry": opts=sorted(sub_inspect["expiry"].unique()); sel=box.selectbox("Expiry",opts,index=0,key=f"insp_sel_exp_{sym}"); sub_inspect=sub_inspect[sub_inspect["expiry"]==sel]
         else: opts=sorted(sub_inspect["strike"].unique()); sel=box.selectbox("Strike",opts,format_func=lambda x:f"{x:.2f}",index=0,key=f"insp_sel_str_{sym}"); sub_inspect=sub_inspect[sub_inspect["strike"]==sel]
         if sub_inspect.empty: box.info("No data matches selection."); return
-        rename_map={"expiry":"Expiry","strike":"Strike","dte":"DTE","delta":"Δ","POP":"POP %","monthly_yield":"Mnth Yield %","actual_yield":"Act Yield %","premium_dollars":"Premium $","iv":"IV %","bid":"Bid","mid":"Mid","ask":"Ask","last":"Option Last Close","Price Used":"Price Used"}
-        sub_display=sub_inspect.rename(columns={k:v for k,v in rename_map.items() if k in sub_inspect.columns})
-        desired_cols=["Expiry","Strike","DTE","Δ","POP %","Mnth Yield %","Act Yield %","Premium $","IV %","Bid","Mid","Ask","Option Last Close","Price Used"]
-        display_cols=[col for col in desired_cols if col in sub_display.columns]
-        fmt_ins={"Strike":"{:.2f}","Δ":"{:.2f}","POP %":"{:.1f}%","Mnth Yield %":"{:.2f}%","Act Yield %":"{:.2f}%","Premium $":"${:.2f}","IV %":"{:.1f}%","Bid":"{:.2f}","Mid":"{:.2f}","Ask":"{:.2f}","Option Last Close":"{:.2f}","Price Used":"{:.2f}"}
-        final_fmt_ins={k:v for k,v in fmt_ins.items() if k in display_cols}
-        sort_col="Strike" if mode=="Expiry" else "Expiry";
-        if sort_col in sub_display.columns: sub_display=sub_display.sort_values(by=sort_col)
-        box.dataframe(sub_display[display_cols].style.format(final_fmt_ins,na_rep="-",precision=2),use_container_width=True,hide_index=True)
+        rename_map={
+            "expiry":"Expiry","strike":"Strike","dte":"DTE","delta":"Δ","POP":"POP %","monthly_yield":"Mnth Yield %","actual_yield":"Act Yield %",
+            "premium_dollars":"Premium $","collateral":"Collateral $","max_loss":"Max Loss $","breakeven":"Breakeven $","breakeven_pct":"Breakeven %",
+            "total_premium":"Total Premium $","total_collateral":"Total Collateral $","total_max_loss":"Total Max Loss $",
+            "iv":"IV %","bid":"Bid","mid":"Mid","ask":"Ask","last":"Option Last Close","Price Used":"Price Used","contracts_max":"Contracts (max)"
+        }
+        if layout == "Compact":
+            # Build transposed metrics view
+            if mode == "Expiry":
+                cols = sorted(sub_inspect["strike"].unique())
+                header_fmt = lambda v: fmt_number(v)
+            else:
+                cols = sorted(sub_inspect["expiry"].unique())
+                header_fmt = lambda v: f"{v}"
+            # Define metrics rows (label -> (source_col, formatter_func))
+            metrics = [
+                ("Δ", "delta", lambda v: f"{v:,.2f}" if pd.notna(v) else "-"),
+                ("POP %", "POP", fmt_percent),
+                ("Mnth Yield %", "monthly_yield", fmt_percent),
+                ("Act Yield %", "actual_yield", fmt_percent),
+                ("Premium $", "premium_dollars", fmt_currency),
+                ("Collateral $", "collateral", fmt_currency),
+                ("Max Loss $", "max_loss", fmt_currency),
+                ("Breakeven $", "breakeven", fmt_currency),
+                ("Breakeven %", "breakeven_pct", fmt_percent),
+                ("Contracts (max)", "contracts_max", fmt_number),
+                ("Total Premium $", "total_premium", fmt_currency),
+                ("Total Collateral $", "total_collateral", fmt_currency),
+                ("Total Max Loss $", "total_max_loss", fmt_currency),
+                ("DTE", "dte", fmt_number)
+            ]
+            # Build a dict of rows
+            rows_out = {}
+            for label, src, func in metrics:
+                if src not in sub_inspect.columns: continue
+                vals = []
+                for c in cols:
+                    if mode == "Expiry":
+                        row = sub_inspect[sub_inspect["strike"]==c].head(1)
+                    else:
+                        row = sub_inspect[sub_inspect["expiry"]==c].head(1)
+                    if row.empty:
+                        vals.append("-")
+                    else:
+                        v = row.iloc[0].get(src, None)
+                        try:
+                            vals.append(func(v))
+                        except Exception:
+                            vals.append("-")
+                rows_out[label] = vals
+            compact_df = pd.DataFrame(rows_out, index=[header_fmt(c) for c in cols]).T
+            box.dataframe(compact_df, use_container_width=True)
+        else:
+            sub_display=sub_inspect.rename(columns={k:v for k,v in rename_map.items() if k in sub_inspect.columns})
+            desired_cols=["Expiry","Strike","DTE","Δ","POP %","Mnth Yield %","Act Yield %","Premium $","Total Premium $","Collateral $","Total Collateral $","Max Loss $","Total Max Loss $","Breakeven $","Breakeven %","Contracts (max)","IV %","Bid","Mid","Ask","Option Last Close","Price Used"]
+            display_cols=[col for col in desired_cols if col in sub_display.columns]
+            fmt_funcs={
+                "Strike": lambda v: fmt_number(v),
+                "Δ": lambda v: f"{v:,.2f}" if pd.notna(v) else "-",
+                "POP %": lambda v: fmt_percent(v),
+                "Mnth Yield %": lambda v: fmt_percent(v),
+                "Act Yield %": lambda v: fmt_percent(v),
+                "Premium $": lambda v: fmt_currency(v),
+                "Total Premium $": lambda v: fmt_currency(v),
+                "Collateral $": lambda v: fmt_currency(v),
+                "Total Collateral $": lambda v: fmt_currency(v),
+                "Max Loss $": lambda v: fmt_currency(v),
+                "Total Max Loss $": lambda v: fmt_currency(v),
+                "Breakeven $": lambda v: fmt_currency(v),
+                "Breakeven %": lambda v: fmt_percent(v),
+                "Contracts (max)": lambda v: fmt_number(v),
+                "IV %": lambda v: fmt_percent(v),
+                "Bid": lambda v: fmt_number(v),
+                "Mid": lambda v: fmt_number(v),
+                "Ask": lambda v: fmt_number(v),
+                "Option Last Close": lambda v: fmt_number(v),
+                "Price Used": lambda v: fmt_number(v)
+            }
+            final_fmt_ins={k:v for k,v in fmt_funcs.items() if k in display_cols}
+            sort_col="Strike" if mode=="Expiry" else "Expiry";
+            if sort_col in sub_display.columns: sub_display=sub_display.sort_values(by=sort_col)
+            box.dataframe(sub_display[display_cols].style.format(final_fmt_ins,na_rep="-"),use_container_width=True,hide_index=True)
     except Exception as e: box.error(f"Inspector error: {e}")
 
 
@@ -348,11 +457,20 @@ async def render(sym: str, box: st.container, price_trigger: float, options_trig
 # ==============================================================================
 # --- Initial Setup ---
 check_and_update_ticker_list()
+@st.cache_resource(ttl=3600)
+def load_valid_tickers() -> set:
+    """Loads valid ticker set from JSON (cached)."""
+    if VALID_TICKERS_FILE.exists():
+        try:
+            data = json.loads(VALID_TICKERS_FILE.read_text(encoding="utf-8"))
+            return set(data) if isinstance(data, list) else set()
+        except Exception:
+            return set()
+    return set()
 valid_ticker_list = sorted(list(load_valid_tickers()))
 
 # --- App Title & CSS ---
 st.title("Δ Options Yield Matrix")
-# Updated CSS for smaller sidebar elements
 st.markdown("""
 <style>
     /* General Sidebar spacing */
@@ -367,6 +485,13 @@ st.markdown("""
     td[class^="col"] { background-color: inherit !important; color: inherit !important; }
     .stDataFrame th[data-testid="stTick"] { font-size: 0.8rem; padding: 4px !important; }
     div[data-testid="stVerticalBlock"] > [style*="flex-direction: column;"] > [data-testid="stVerticalBlock"] { gap: 0.5rem; }
+    /* Make only the small sidebar buttons more compact (e.g., the ✕ next to tickers) */
+    [data-testid="stSidebar"] .stButton > button {
+      padding: 2px 6px !important;
+      min-height: 26px !important;
+      height: 26px !important;
+      line-height: 1 !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -386,7 +511,23 @@ def refresh_options():
     asyncio.run(clear_marketdata_cache())
 
 # --- Session State Initialization ---
-default_state = {"price_refresh_trigger": pytime.time(), "options_refresh_trigger": pytime.time(), "manual_ticker_input_value": "", "display_mode_value": cfg.get("DISPLAY_MODE", "Monthly Yield %"), "strategy_value": cfg.get("DEFAULT_STRATEGY", "PUT"), "min_dte_value": cfg.get("MIN_DTE", 2), "max_dte_value": cfg.get("MAX_DTE", 60), "pop_slider_value": cfg.get("MIN_POP_FILTER", 60.0), "delta_slider_value": tuple(cfg.get("DELTA_RANGE_FILTER", [0.10, 0.35])), "yield_slider_value": cfg.get("MIN_YIELD_FILTER", 3.0)}
+default_state = {
+    "price_refresh_trigger": pytime.time(),
+    "options_refresh_trigger": pytime.time(),
+    "manual_ticker_input_value": "",
+    "display_mode_value": cfg.get("DISPLAY_MODE", "Monthly Yield %"),
+    "strategy_value": cfg.get("DEFAULT_STRATEGY", "PUT"),
+    "min_dte_value": cfg.get("MIN_DTE", 2),
+    "max_dte_value": cfg.get("MAX_DTE", 60),
+    "pop_slider_value": cfg.get("MIN_POP_FILTER", 60.0),
+    "delta_slider_value": tuple(cfg.get("DELTA_RANGE_FILTER", [0.10, 0.35])),
+    "yield_slider_value": cfg.get("MIN_YIELD_FILTER", 3.0),
+    # Portfolio sizing defaults
+    "portfolio_value_usd": 300000.0,
+    "sizing_mode": "Max collateral %",
+    "sizing_percent": 15.0,
+    "rounding_mode": "Nearest"
+}
 for key, default_value in default_state.items():
     st.session_state.setdefault(key, default_value)
 # Load watchlist into state only if not already present or empty
@@ -415,8 +556,10 @@ selected_tickers_sidebar = [] # Initialize list for selected tickers
 # Ensure tickers in state are clean *before* iterating for display
 st.session_state.tickers = sorted(list(set(filter(None, map(str.strip, st.session_state.get("tickers", [])))))) # Use .get for safety
 for sym in st.session_state.tickers: # Watchlist display loop
-    cols=st.sidebar.columns([0.8, 0.2]); is_selected=cols[0].checkbox(sym,value=False,key=f"chk_{sym}") # Unique key
-    if is_selected: selected_tickers_sidebar.append(sym) # <<< Populate the list
+    cols = st.sidebar.columns([6,1])
+    with cols[0]:
+        chk = st.checkbox(sym, key=f"chk_{sym}", value=False)
+        if chk: selected_tickers_sidebar.append(sym)
     if cols[1].button("✕",key=f"del_{sym}",help=f"Remove {sym}"): # Unique key
         st.session_state.tickers.remove(sym); save_watchlist(st.session_state.tickers)
         if f"chk_{sym}" in st.session_state: del st.session_state[f"chk_{sym}"] # Clean up checkbox state
@@ -443,7 +586,21 @@ st.sidebar.header("Filters") # Filters Section
 # Display Mode Radio — bind directly into session_state.display_mode_value
 st.sidebar.radio(
     "Show in matrix:",
-    ["Monthly Yield %","Actual Yield %","Δ","POP","Premium ($)"],
+    [
+        "Monthly Yield %",
+        "Actual Yield %",
+        "Δ",
+        "POP",
+        "Premium ($)",
+        "Contracts (max)",
+        "Collateral ($)",
+        "Max Loss ($)",
+        "Breakeven ($)",
+        "Breakeven (%)",
+        "Total Premium ($)",
+        "Total Collateral ($)",
+        "Total Max Loss ($)"
+    ],
     key="display_mode_value"
 )
 # Strategy Radio
@@ -455,9 +612,18 @@ st.sidebar.radio(
 st.sidebar.number_input("Min DTE:", min_value=0, max_value=365, key="min_dte_value")
 st.sidebar.number_input("Max DTE:", min_value=st.session_state.min_dte_value+1, max_value=730, key="max_dte_value")
 # Sliders
+st.sidebar.slider("|Δ| range:", 0.0, 1.0, value=st.session_state.delta_slider_value, key="delta_slider_value", format="%.2f")
 st.sidebar.slider("Min POP (%):", 0.0, 100.0, key="pop_slider_value", format="%.1f%%")
-st.sidebar.slider("|Δ| range:", 0.0, 1.0, key="delta_slider_value", format="%.2f")
-st.sidebar.slider("Min Mnth Yield (%):", 0.0, 25.0, key="yield_slider_value", format="%.1f%%")
+st.sidebar.number_input("Min Mnth Yield (%)", min_value=0.0, max_value=100.0, step=0.1, key="yield_slider_value")
+
+# --- Portfolio Sizing Inputs ---
+st.sidebar.markdown("---")
+st.sidebar.subheader("Portfolio Sizing")
+st.sidebar.number_input("Portfolio value (USD)", min_value=0.0, step=1000.0, key="portfolio_value_usd")
+st.sidebar.radio("Sizing mode", ["Max collateral %", "Max loss %"], key="sizing_mode")
+st.sidebar.number_input("Percent of portfolio (%)", min_value=0.0, max_value=100.0, step=1.0, key="sizing_percent")
+st.sidebar.caption(f"Portfolio: {fmt_currency(st.session_state.portfolio_value_usd)} | Percent: {fmt_percent(st.session_state.sizing_percent)} | Min Mnth Yield: {fmt_percent(st.session_state.yield_slider_value)}")
+st.sidebar.radio("Contracts rounding", ["Nearest","Floor","Ceil"], key="rounding_mode")
 
 # --- API Token Check ---
 api_token = st.secrets.get("api", {}).get("marketdata_token")
