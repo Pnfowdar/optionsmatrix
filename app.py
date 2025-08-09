@@ -612,7 +612,7 @@ st.sidebar.radio(
 st.sidebar.number_input("Min DTE:", min_value=0, max_value=365, key="min_dte_value")
 st.sidebar.number_input("Max DTE:", min_value=st.session_state.min_dte_value+1, max_value=730, key="max_dte_value")
 # Sliders
-st.sidebar.slider("|Δ| range:", 0.0, 1.0, value=st.session_state.delta_slider_value, key="delta_slider_value", format="%.2f")
+st.sidebar.slider("|Δ| range:", 0.0, 1.0, key="delta_slider_value", format="%.2f")
 st.sidebar.slider("Min POP (%):", 0.0, 100.0, key="pop_slider_value", format="%.1f%%")
 st.sidebar.number_input("Min Mnth Yield (%)", min_value=0.0, max_value=100.0, step=0.1, key="yield_slider_value")
 
