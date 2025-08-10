@@ -4,6 +4,9 @@ import asyncio
 import json
 from pathlib import Path
 import toml
+import math
+from datetime import date
+from scipy.stats import norm
 
 # Make nested asyncio calls safe in Streamlit
 try:
@@ -13,7 +16,7 @@ except Exception:
     pass
 
 from marketdata_client import MarketDataClient, clear_marketdata_cache
-from matrix import build_matrix
+from matrix import build_matrix, R
 from supabase_utils import (
     supabase_available,
     load_scanner_rules_supabase,
@@ -222,6 +225,136 @@ async def _scan_once_async(rules: list[dict], min_dte: int, max_dte: int) -> pd.
     df.sort_values(by=["monthly_yield", "POP", "dte"], ascending=[False, False, True], inplace=True)
     return df
 
+# Refresh only the current matches using live feed (sip), bypassing cache.
+async def _refresh_matches_live(matches: pd.DataFrame, min_dte: int, max_dte: int) -> pd.DataFrame:
+    token = st.secrets.get("api", {}).get("marketdata_token")
+    if not token or matches is None or matches.empty:
+        return pd.DataFrame()
+
+    client = MarketDataClient(token)
+
+    # Group by symbol/strategy/expiry and collect required strikes for each group
+    need: dict[tuple[str, str, str], set[float]] = {}
+    for _, row in matches.iterrows():
+        try:
+            sym = str(row.get("symbol", "")).strip().upper()
+            strat = str(row.get("strategy", "PUT")).strip().upper()
+            exp = str(row.get("expiry", ""))
+            k = float(row.get("strike", 0) or 0)
+            if not (sym and exp and strat in ("PUT", "CALL") and k > 0):
+                continue
+            need.setdefault((sym, strat, exp), set()).add(k)
+        except Exception:
+            continue
+
+    today = date.today()
+    results: list[dict] = []
+
+    async def fetch_group(sym: str, strat: str, exp: str, strikes: set[float]):
+        side = 'call' if strat == 'CALL' else 'put'
+        try:
+            # Live spot and chain, no cache
+            spot = await client.quote(sym, feed='sip', ttl=0)
+            chain = await client.chain(sym, exp, side, feed='sip', ttl=0)
+            exp_date = date.fromisoformat(exp)
+            dte = (exp_date - today).days
+            if dte <= 0 or not isinstance(chain, list):
+                return []
+
+            out: list[dict] = []
+            for o in chain:
+                try:
+                    K = float(o.get('strike', 0) or 0)
+                    if K not in strikes:
+                        continue
+                    bid = float(o.get('bid', 0) or 0)
+                    ask = float(o.get('ask', bid) or bid)
+                    last = float(o.get('last', 0) or 0)
+                    delta_raw, iv_raw = o.get('delta'), o.get('iv')
+                    if not (K>0 and bid>=0 and isinstance(delta_raw,(int,float)) and isinstance(iv_raw,(int,float)) and iv_raw>=0):
+                        continue
+                    delta_val, iv_val = float(delta_raw), float(iv_raw)
+
+                    mid = (bid + ask) / 2.0
+                    threshold = 0.5 * ask
+                    # If bid is zero, use zero (matches matrix.py)
+                    if bid == 0.0:
+                        price_used = 0.0; method = "bid_zero"
+                    elif bid >= threshold:
+                        price_used = mid; method = "midpoint"
+                    elif (threshold <= last <= ask) and (last >= bid):
+                        price_used = last; method = "last_close"
+                    else:
+                        # 20% of bid, clamped within [bid, ask]
+                        price_used = min(max(bid * 1.2, bid), ask)
+                        method = "bid_plus_20%"
+
+                    actual_yield = (price_used / K) * 100.0 if K>0 else 0.0
+                    monthly_yield = actual_yield * (30.0 / dte) if dte>0 else 0.0
+                    premium = price_used * 100.0
+                    collateral = K * 100.0
+                    max_loss = max(collateral - premium, 0.0)
+                    breakeven = K - price_used if strat=='PUT' else K + price_used
+                    breakeven_pct = 0.0
+                    try:
+                        if spot and spot > 0:
+                            diff = (spot - breakeven) if strat=='PUT' else (breakeven - spot)
+                            breakeven_pct = (diff / spot) * 100.0
+                    except Exception:
+                        breakeven_pct = 0.0
+
+                    # POP calculation (same as matrix)
+                    pop = 0.0
+                    T = dte / 365.0
+                    if spot and spot>0 and iv_val>0 and K>0 and T>0:
+                        BE = (K + price_used) if strat=='CALL' else max(K - price_used, 1e-9)
+                        try:
+                            d2 = (math.log(spot/BE) + (R - 0.5*iv_val**2)*T) / (iv_val*math.sqrt(T)) if iv_val>0 and T>0 else 0.0
+                            pop = (1 - norm.cdf(d2)) if strat=='CALL' else norm.cdf(d2)
+                            pop = max(0.0, min(pop, 1.0))
+                        except Exception:
+                            pop = 0.0
+
+                    out.append({
+                        "symbol": sym,
+                        "strategy": strat,
+                        "expiry": exp,
+                        "dte": dte,
+                        "strike": K,
+                        "monthly_yield": round(monthly_yield, 2),
+                        "POP": round(pop*100.0, 1),
+                        "delta": float(delta_val),
+                        "premium($)": round(premium, 2),
+                        "price_used": float(price_used),
+                        "method": method,
+                        "iv(%)": round(iv_val*100.0, 1),
+                        "breakeven": round(breakeven, 2),
+                        "breakeven_%": round(breakeven_pct, 2),
+                    })
+                except Exception:
+                    continue
+            return out
+        except Exception as e:
+            print(f"ERROR [Scanner._refresh_matches_live] {sym} {exp} {strat}: {e}")
+            return []
+
+    # Schedule all groups concurrently
+    tasks = [fetch_group(sym, strat, exp, strikes) for (sym, strat, exp), strikes in need.items()]
+    try:
+        groups = await asyncio.gather(*tasks, return_exceptions=True)
+        for g in groups:
+            if isinstance(g, Exception) or not g:
+                continue
+            results.extend(g)
+    except Exception as e:
+        print(f"ERROR [Scanner._refresh_matches_live] gather: {e}")
+
+    if not results:
+        return pd.DataFrame()
+    df = pd.DataFrame(results)
+    df.sort_values(by=["monthly_yield", "POP", "dte"], ascending=[False, False, True], inplace=True)
+    return df
+
 # -----------------------------------------------------------------------------
 # UI
 # -----------------------------------------------------------------------------
@@ -329,9 +462,27 @@ if run_scan:
             results_df = pd.DataFrame()
 
 if not results_df.empty:
-    st.subheader("Matches")
-    st.dataframe(results_df, use_container_width=True, hide_index=True)
-    csv = results_df.to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ Download CSV", data=csv, file_name="scanner_results.csv", mime="text/csv")
+    # Offer live refresh for current matches only
+    lcol1, lcol2 = st.columns([3, 1])
+    with lcol2:
+        refresh_live = st.button("⚡ Refresh Matches (Live)")
+
+    live_df = None
+    if refresh_live:
+        with st.spinner("Refreshing matches with live data..."):
+            try:
+                loop = asyncio.get_event_loop()
+                live_df = loop.run_until_complete(_refresh_matches_live(results_df, min_dte, max_dte))
+            except RuntimeError:
+                live_df = asyncio.run(_refresh_matches_live(results_df, min_dte, max_dte))
+            except Exception as e:
+                st.error(f"Live refresh error: {e}")
+                live_df = pd.DataFrame()
+
+    display_df = live_df if (live_df is not None and not live_df.empty) else results_df
+    st.subheader("Matches (Live)" if live_df is not None else "Matches")
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    csv = display_df.to_csv(index=False).encode("utf-8")
+    st.download_button("⬇️ Download CSV", data=csv, file_name=("scanner_results_live.csv" if live_df is not None else "scanner_results.csv"), mime="text/csv")
 else:
     st.info("No matches yet. Edit rules and click Run Scan.")
