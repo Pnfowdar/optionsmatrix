@@ -1,0 +1,44 @@
+[
+  {
+    "symbol": "IBIT",
+    "desired_strike": 63.5,
+    "min_monthly_yield": 4.0,
+    "strategy": "PUT"
+  },
+  {
+    "symbol": "MSTR",
+    "desired_strike": 360.0,
+    "min_monthly_yield": 5.0,
+    "strategy": "PUT"
+  },
+  {
+    "symbol": "NVDA",
+    "desired_strike": 170.0,
+    "min_monthly_yield": 4.0,
+    "strategy": "PUT"
+  },
+  {
+    "symbol": "RGTI",
+    "desired_strike": 12.5,
+    "min_monthly_yield": 4.5,
+    "strategy": "PUT"
+  },
+  {
+    "symbol": "SOUN",
+    "desired_strike": 9.0,
+    "min_monthly_yield": 4.0,
+    "strategy": "PUT"
+  },
+  {
+    "symbol": "SPY",
+    "desired_strike": 620.0,
+    "min_monthly_yield": 2.5,
+    "strategy": "PUT"
+  },
+  {
+    "symbol": "RGTI",
+    "desired_strike": 11.0,
+    "min_monthly_yield": 3.0,
+    "strategy": "PUT"
+  }
+]

@@ -1,4 +1,4 @@
-# Options Yield Matrix v7
+# Options Yield Matrix v11
 
 A Streamlit web application designed to visualize and analyze options data, focusing on yield potential and probability of profit (POP) for option selling strategies (Puts and Calls). It fetches data from `marketdata.app` and `yfinance`, providing interactive filtering and display capabilities.
 
@@ -48,6 +48,41 @@ This version defaults to using the cost-effective **cached data feed** from `mar
     *   Per-ticker button to refresh with **Live** options data (active only when market is open).
 *   **Configuration File (`config.toml`):** Define default tickers, filter ranges, risk-free rate, and scoring bounds.
 *   **API Token Security:** Uses Streamlit Secrets (`secrets.toml`) to manage the `marketdata.app` API token.
+
+## Scanner (Multipage)
+
+The app now includes a multipage "Scanner" that finds only those contracts meeting your per-ticker criteria at or beyond a desired strike.
+
+- __What it does__: For each rule (Symbol, Desired Strike, Min Monthly Yield, Strategy PUT/CALL), the scanner fetches cached options data and outputs contracts where:
+  - PUT: strike <= desired strike, and monthly yield >= threshold
+  - CALL: strike >= desired strike, and monthly yield >= threshold
+- __Feed__: Uses `marketdata.app` cached feed to minimize API cost while staying consistent with the main matrix logic.
+- __Where__: Appears as a separate page at `pages/1_Scanner.py` in the Streamlit sidebar.
+
+### How to use
+
+1. Open the "Scanner" page from the sidebar.
+2. Set global scan window: Min/Max DTE, and optionally toggle "Top 1 per symbol".
+3. In __Scanner Rules__, add/edit rows with:
+   - `symbol` (e.g., SPY)
+   - `desired_strike` (0 means ignore strike threshold)
+   - `min_monthly_yield` (in %)
+   - `strategy` (PUT or CALL)
+4. Click __Save Rules__ to persist to `scanner_rules.json` in project root.
+5. Optionally click __Import Watchlist__ to seed rules from `watchlist.json`.
+6. Click __Run Scan__. Matching contracts render in a table.
+7. Click __Download CSV__ to export results.
+
+### Refreshing & Caching
+
+- __Refresh (clear API cache)__ clears the in-memory cache used by the underlying `MarketDataClient`, forcing fresh pulls on the next scan.
+- Results are also memoized briefly with `st.cache_data` to keep the UI snappy during small tweaks.
+
+### Implementation Notes
+
+- Reuses `matrix.build_matrix()` so monthly yield, POP, pricing method, and DTE match the main page exactly.
+- Fetches only the strategies you actually use per symbol (PUT and/or CALL) concurrently to reduce requests.
+- Rules are saved to `scanner_rules.json` at the project root; you can edit this file manually or via the UI.
 
 ## Requirements
 
@@ -124,7 +159,7 @@ Uses Python 3. Key dependencies are listed in `requirements.txt`, including:
 
 ## Supabase: Persistent Watchlist Storage
 
-This app can persist the sidebar watchlist in Supabase. If Supabase is configured, the app will load/save the watchlist there and also mirror it to `watchlist.json` as a local fallback.
+This app can persist the sidebar watchlist in Supabase. If Supabase is configured in `.streamlit/secrets.toml`, the app will load/save the watchlist there and also mirror it to `watchlist.json` as a local fallback.
 
 ### 1) Create the table (SQL)
 
@@ -179,3 +214,40 @@ This includes the Supabase Python client (`supabase`).
 * On startup, the app tries to load the watchlist from Supabase. If the table is empty, it initializes it with defaults from `config.toml`.
 * On add/remove in the sidebar, the app upserts the list to Supabase and mirrors to `watchlist.json`.
 * If Supabase is unreachable, local file persistence continues to work.
+
+### Scanner Rules (Supabase persistence)
+
+The Scanner page can persist its rule set in Supabase (with local JSON fallback). If Supabase is configured in `.streamlit/secrets.toml`, the Scanner will attempt to load from/save to a single-row table `scanner_rules`.
+
+1) Create the table (SQL)
+
+```sql
+create table if not exists public.scanner_rules (
+  id text primary key,
+  rules jsonb not null default '[]'::jsonb
+);
+
+-- Option A: leave RLS disabled for this table (simplest)
+-- alter table public.scanner_rules disable row level security;
+```
+
+2) Behavior
+
+- The app reads `scanner_rules` row with `id = 'default'`.
+- On Save Rules in the Scanner page, the app upserts `{ id: 'default', rules: [...] }`.
+- The `rules` JSONB is a list of objects. Duplicates and ordering are preserved to allow multiple strike/yield targets per symbol, e.g.:
+
+```json
+{
+  "id": "default",
+  "rules": [
+    { "symbol": "SPY", "desired_strike": 520, "min_monthly_yield": 3.0, "strategy": "PUT" },
+    { "symbol": "SPY", "desired_strike": 600, "min_monthly_yield": 2.5, "strategy": "CALL" },
+    { "symbol": "MSFT", "desired_strike": 380, "min_monthly_yield": 2.0, "strategy": "PUT" }
+  ]
+}
+```
+
+3) Local fallback
+
+- If Supabase is unavailable or empty, rules are loaded from `scanner_rules.json` at the project root and saved there as well.

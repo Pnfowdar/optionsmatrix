@@ -1,7 +1,7 @@
 # supabase_utils.py
 
 from __future__ import annotations
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import json
 import streamlit as st
 
@@ -13,6 +13,10 @@ except Exception:
 
 TABLE_NAME = "watchlist"
 ROW_ID = "default"  # single-row storage for this app instance
+
+# --- Scanner Rules Persistence (Supabase) ---
+SCANNER_TABLE_NAME = "scanner_rules"
+SCANNER_ROW_ID = ROW_ID  # reuse same default id
 
 
 def _get_supabase_client() -> Optional["Client"]:
@@ -76,4 +80,67 @@ def save_watchlist_supabase(tickers: List[str]) -> bool:
         return True
     except Exception as e:
         print(f"ERROR [supabase_utils.save] {e}")
+        return False
+
+
+def load_scanner_rules_supabase() -> list[dict]:
+    """Load scanner rules from Supabase. Returns [] if none found or any error.
+
+    Expected row shape: { id: TEXT, rules: JSONB(list[dict]) }
+    """
+    client = _get_supabase_client()
+    if client is None:
+        return []
+    try:
+        res = client.table(SCANNER_TABLE_NAME).select("id,rules").eq("id", SCANNER_ROW_ID).execute()
+        data = getattr(res, "data", None) or []
+        if not data:
+            return []
+        row = data[0]
+        rules = row.get("rules")
+        # Handle JSON coming back as string
+        if isinstance(rules, str):
+            try:
+                rules = json.loads(rules)
+            except Exception:
+                return []
+        # Validate list-of-dicts shape (keep duplicates as-is)
+        if isinstance(rules, list) and all(isinstance(r, dict) for r in rules):
+            return rules
+        return []
+    except Exception as e:
+        print(f"WARN [supabase_utils.load_scanner_rules] {e}")
+        return []
+
+
+def save_scanner_rules_supabase(rules: list[dict]) -> bool:
+    """Upsert scanner rules into Supabase. Returns True on success.
+
+    Does minimal validation and preserves ordering/duplicates.
+    """
+    client = _get_supabase_client()
+    if client is None:
+        return False
+    try:
+        # Ensure serializable list-of-dicts
+        safe_rules: list[Dict[str, Any]] = []
+        for r in rules or []:
+            if isinstance(r, dict):
+                # Copy shallow to avoid mutating caller
+                entry = dict(r)
+                # Normalize basic fields if present
+                sym = entry.get("symbol")
+                if isinstance(sym, str):
+                    entry["symbol"] = sym.strip().upper()
+                # Strategy normalization
+                strat = entry.get("strategy")
+                if isinstance(strat, str):
+                    s = strat.strip().upper()
+                    entry["strategy"] = "CALL" if s == "CALL" else "PUT"
+                safe_rules.append(entry)
+        payload = {"id": SCANNER_ROW_ID, "rules": safe_rules}
+        client.table(SCANNER_TABLE_NAME).upsert(payload, on_conflict="id").execute()
+        return True
+    except Exception as e:
+        print(f"ERROR [supabase_utils.save_scanner_rules] {e}")
         return False
