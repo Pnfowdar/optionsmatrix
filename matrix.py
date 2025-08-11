@@ -2,10 +2,13 @@ from datetime import datetime, date, time
 from zoneinfo import ZoneInfo
 import math, toml
 import pandas as pd
-from scipy.stats import norm
 from typing import List, Tuple, Dict, Any
 import asyncio  # Async support
 from marketdata_client import MarketDataClient
+
+# Lightweight normal CDF (avoid SciPy dependency)
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 # Load config with error handling
 try:
@@ -59,10 +62,17 @@ def compute_score_matrix(monthly: pd.DataFrame, pop: pd.DataFrame) -> pd.DataFra
         return pd.DataFrame()
     pop_f = pop / 100.0; yld_f = monthly / 100.0
     pop_range = MAX_POP - MIN_POP; yld_range = MAX_YLD - MIN_YLD
-    pop_n = ((pop_f - MIN_POP) / pop_range).clip(0, 1) if pop_range > 0 else pd.Series(0.5, index=pop_f.index)
-    yld_n = ((yld_f - MIN_YLD) / yld_range).clip(0, 1) if yld_range > 0 else pd.Series(0.5, index=pop_f.index)
+    # Ensure DataFrame shape even when range collapses
+    if pop_range > 0:
+        pop_n = ((pop_f - MIN_POP) / pop_range).clip(0, 1)
+    else:
+        pop_n = pd.DataFrame(0.5, index=pop_f.index, columns=pop_f.columns)
+    if yld_range > 0:
+        yld_n = ((yld_f - MIN_YLD) / yld_range).clip(0, 1)
+    else:
+        yld_n = pd.DataFrame(0.5, index=yld_f.index, columns=yld_f.columns)
     score = (pop_n + yld_n) / 2.0
-    return score.fillna(0.0)
+    return score.astype(float).fillna(0.0)
 
 
 async def build_matrix(
@@ -152,7 +162,7 @@ async def build_matrix(
                     BE = (K + price_used) if side=='call' else max(K - price_used, 1e-9)
                     try:
                         d2 = (math.log(spot_price/BE) + (R - 0.5*iv_val**2)*T) / (iv_val*math.sqrt(T)) if iv_val>0 and T>0 else 0.0
-                        pop = (1 - norm.cdf(d2)) if side=='call' else norm.cdf(d2)
+                        pop = (1 - _norm_cdf(d2)) if side=='call' else _norm_cdf(d2)
                         pop = max(0.0, min(pop, 1.0))
                     except Exception:
                         pop = 0.0

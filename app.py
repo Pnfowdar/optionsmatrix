@@ -16,6 +16,13 @@ from io import StringIO
 from marketdata_client import MarketDataClient
 from supabase_utils import supabase_available, load_watchlist_supabase, save_watchlist_supabase
 
+# Optional: matplotlib for Styler background gradients
+try:
+    import matplotlib  # noqa: F401
+    MATPLOTLIB_AVAILABLE = True
+except Exception:
+    MATPLOTLIB_AVAILABLE = False
+
 # ==============================================================================
 #  1. Set Page Config & Apply Nest Asyncio FIRST
 # ==============================================================================
@@ -312,12 +319,17 @@ async def render(sym: str, box: st.container, price_trigger: float, options_trig
         value_col=col_map.get(st.session_state.display_mode_value,"monthly_yield");
         if value_col not in df_filtered.columns: box.error(f"Display col '{value_col}' missing."); return
         disp_pivot=pd.pivot_table(df_filtered,index="expiry",columns="strike",values=value_col,aggfunc='mean')
+        # Build auxiliary pivots
         score_matrix=pd.DataFrame()
+        pop_pivot = pd.pivot_table(df_filtered,index="expiry",columns="strike",values="POP",aggfunc='mean') if "POP" in df_filtered.columns else pd.DataFrame()
         if "monthly_yield" in df_filtered.columns and "POP" in df_filtered.columns:
             mp=pd.pivot_table(df_filtered,index="expiry",columns="strike",values="monthly_yield",aggfunc='mean')
             pp=pd.pivot_table(df_filtered,index="expiry",columns="strike",values="POP",aggfunc='mean')
-            if not mp.empty and not pp.empty: ci=mp.index.intersection(pp.index); cc=mp.columns.intersection(pp.columns);
-            if not ci.empty and not cc.empty: score_matrix=compute_score_matrix(mp.loc[ci,cc],pp.loc[ci,cc])
+            if not mp.empty and not pp.empty:
+                ci=mp.index.intersection(pp.index)
+                cc=mp.columns.intersection(pp.columns)
+                if not ci.empty and not cc.empty:
+                    score_matrix=compute_score_matrix(mp.loc[ci,cc],pp.loc[ci,cc])
     except Exception as e: box.error(f"Pivot/Score error: {e}"); return
     if disp_pivot.empty: box.warning("Filtered data resulted in empty pivot."); return
 
@@ -328,11 +340,22 @@ async def render(sym: str, box: st.container, price_trigger: float, options_trig
             valid_spot=spot_price > 0; dist_vals=[round(((k-spot_price)/spot_price)*100,1) if valid_spot else 0.0 for k in valid_strikes]
             mi_tuples=[(f"{k:.2f}",f"{d:+.1f}%") for k,d in zip(valid_strikes,dist_vals)]; mi=pd.MultiIndex.from_tuples(mi_tuples,names=["Strike","Δ% Spot"])
             disp_pivot=disp_pivot[orig_valid_cols]; disp_pivot.columns=mi
-            if not score_matrix.empty: # Align score matrix
+            # Align score matrix (kept for potential future use)
+            if not score_matrix.empty:
                  sc=pd.to_numeric(score_matrix.columns,errors='coerce'); sv=sc.notna(); soc=score_matrix.columns[sv].tolist(); ck=[c for c in soc if c in orig_valid_cols]
                  if ck: sf=score_matrix[ck]; sf.columns=mi; score_matrix=sf.reindex(index=disp_pivot.index,columns=disp_pivot.columns).fillna(0.0)
                  else: score_matrix=pd.DataFrame(0.0,index=disp_pivot.index,columns=disp_pivot.columns)
             else: score_matrix=pd.DataFrame(0.0,index=disp_pivot.index,columns=disp_pivot.columns)
+            # Align POP matrix for coloring
+            if not pop_pivot.empty:
+                 pc=pd.to_numeric(pop_pivot.columns,errors='coerce'); pv=pc.notna(); poc=pop_pivot.columns[pv].tolist(); pck=[c for c in poc if c in orig_valid_cols]
+                 if pck:
+                     pf=pop_pivot[pck]; pf.columns=mi
+                     pop_aligned=pf.reindex(index=disp_pivot.index,columns=disp_pivot.columns).astype(float).fillna(0.0)
+                 else:
+                     pop_aligned=pd.DataFrame(0.0,index=disp_pivot.index,columns=disp_pivot.columns)
+            else:
+                 pop_aligned=pd.DataFrame(0.0,index=disp_pivot.index,columns=disp_pivot.columns)
     except Exception as e: box.error(f"Multi-index error: {e}"); mi=None
 
     # --- Style and Display Matrix ---
@@ -348,11 +371,33 @@ async def render(sym: str, box: st.container, price_trigger: float, options_trig
                 return lambda v: f"{v:,.2f}" if pd.notna(v) else "-"
             return lambda v: fmt_number(v)
         fmt_filter=_formatter_for(value_col)
-        score_aligned=score_matrix.reindex(index=disp_pivot.index, columns=disp_pivot.columns).fillna(0.0) if not score_matrix.empty else pd.DataFrame(0.0,index=disp_pivot.index,columns=disp_pivot.columns)
         styled=disp_pivot.style.format(fmt_filter,na_rep="-")
-        if not score_aligned.empty and not (score_aligned==0).all().all():
-            try: styled=styled.background_gradient(cmap="RdYlGn",gmap=score_aligned.astype(float),axis=None)
-            except Exception as bg_err: box.warning(f"Gradient failed: {bg_err}")
+        # Color cells by combined score (POP + Monthly Yield) when available; fallback to POP
+        try:
+            if 'score_matrix' in locals() and isinstance(score_matrix, pd.DataFrame) and not score_matrix.empty:
+                gmap = score_matrix
+            elif 'pop_aligned' in locals() and isinstance(pop_aligned, pd.DataFrame) and not pop_aligned.empty:
+                gmap = pop_aligned
+            else:
+                gmap = pd.DataFrame(0.0, index=disp_pivot.index, columns=disp_pivot.columns)
+        except Exception:
+            gmap = pd.DataFrame(0.0, index=disp_pivot.index, columns=disp_pivot.columns)
+        if MATPLOTLIB_AVAILABLE and not gmap.empty and not (gmap==0).all().all():
+            try:
+                # Normalize to full range for vibrant colors
+                vmin, vmax = None, None
+                try:
+                    gmin = float(pd.to_numeric(gmap.stack(), errors='coerce').min())
+                    gmax = float(pd.to_numeric(gmap.stack(), errors='coerce').max())
+                    if 0.0 <= gmin <= 1.0 and 0.0 <= gmax <= 1.0:
+                        vmin, vmax = 0.0, 1.0
+                    elif 0.0 <= gmin and gmax <= 100.0:
+                        vmin, vmax = 0.0, 100.0
+                except Exception:
+                    vmin, vmax = None, None
+                styled = styled.background_gradient(cmap="RdYlGn", gmap=gmap.astype(float), vmin=vmin, vmax=vmax, axis=None)
+            except Exception as bg_err:
+                box.warning(f"Gradient failed: {bg_err}")
         styled=styled.highlight_null(color="#AAA")
         box.dataframe(styled,use_container_width=True)
     except Exception as e: box.error(f"Style/Display error: {e}"); box.dataframe(disp_pivot.fillna("-"))
@@ -481,8 +526,9 @@ st.markdown("""
     [data-testid="stSidebar"] .stButton>button { padding: 0px 4px !important; font-size: 0.65rem !important; margin-left: 3px; line-height: 1 !important; height: 1.5em !important;} /* Smaller button */
     [data-testid="stSidebar"] .stCheckbox p { margin-bottom: 0 !important; font-size: 0.85rem !important; line-height: 1.2 !important;} /* Smaller checkbox label */
     /* Main Area Styling */
-    .stDataFrame div[data-testid="stDataFrameData"] > div > div > div.data { background-color: inherit !important; }
-    td[class^="col"] { background-color: inherit !important; color: inherit !important; }
+    /* Remove background override so Pandas Styler gradients show */
+    /* .stDataFrame div[data-testid="stDataFrameData"] > div > div > div.data { background-color: inherit !important; } */
+    td[class^="col"] { color: inherit !important; }
     .stDataFrame th[data-testid="stTick"] { font-size: 0.8rem; padding: 4px !important; }
     div[data-testid="stVerticalBlock"] > [style*="flex-direction: column;"] > [data-testid="stVerticalBlock"] { gap: 0.5rem; }
     /* Make only the small sidebar buttons more compact (e.g., the ✕ next to tickers) */

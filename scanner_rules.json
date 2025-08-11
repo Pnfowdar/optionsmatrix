@@ -1,44 +1,72 @@
 [
   {
     "symbol": "IBIT",
+    "min_pop": 0.0,
+    "strategy": "PUT",
     "desired_strike": 63.5,
-    "min_monthly_yield": 4.0,
-    "strategy": "PUT"
+    "min_monthly_yield": 3.0
   },
   {
     "symbol": "MSTR",
+    "min_pop": 0.0,
+    "strategy": "PUT",
     "desired_strike": 360.0,
-    "min_monthly_yield": 5.0,
-    "strategy": "PUT"
+    "min_monthly_yield": 3.5
   },
   {
     "symbol": "NVDA",
+    "min_pop": 0.0,
+    "strategy": "PUT",
     "desired_strike": 170.0,
-    "min_monthly_yield": 4.0,
-    "strategy": "PUT"
+    "min_monthly_yield": 3.0
   },
   {
     "symbol": "RGTI",
+    "min_pop": 0.0,
+    "strategy": "PUT",
     "desired_strike": 12.5,
-    "min_monthly_yield": 4.5,
-    "strategy": "PUT"
+    "min_monthly_yield": 4.5
   },
   {
     "symbol": "SOUN",
+    "min_pop": 0.0,
+    "strategy": "PUT",
     "desired_strike": 9.0,
-    "min_monthly_yield": 4.0,
-    "strategy": "PUT"
+    "min_monthly_yield": 3.0
   },
   {
     "symbol": "SPY",
+    "min_pop": 0.0,
+    "strategy": "PUT",
     "desired_strike": 620.0,
-    "min_monthly_yield": 2.5,
-    "strategy": "PUT"
+    "min_monthly_yield": 2.5
   },
   {
     "symbol": "RGTI",
+    "min_pop": 0.0,
+    "strategy": "PUT",
     "desired_strike": 11.0,
-    "min_monthly_yield": 3.0,
-    "strategy": "PUT"
+    "min_monthly_yield": 3.0
+  },
+  {
+    "symbol": "BABA",
+    "min_pop": 0.0,
+    "strategy": "PUT",
+    "desired_strike": 110.0,
+    "min_monthly_yield": 3.0
+  },
+  {
+    "symbol": "NNE",
+    "min_pop": 0.0,
+    "strategy": "PUT",
+    "desired_strike": 30.0,
+    "min_monthly_yield": 4.0
+  },
+  {
+    "symbol": "PLTR",
+    "min_pop": 0.0,
+    "strategy": "PUT",
+    "desired_strike": 170.0,
+    "min_monthly_yield": 4.0
   }
 ]

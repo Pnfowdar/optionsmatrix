@@ -6,7 +6,10 @@ from pathlib import Path
 import toml
 import math
 from datetime import date
-from scipy.stats import norm
+
+# Lightweight normal CDF (avoid SciPy dependency)
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 # Make nested asyncio calls safe in Streamlit
 try:
@@ -24,6 +27,10 @@ from supabase_utils import (
     load_scanner_prefs_supabase,
     save_scanner_prefs_supabase,
 )
+
+# Optional: AgGrid for a single editable + sortable grid
+# AgGrid disabled (reverted to Streamlit editor + sortable view)
+AGGRID_AVAILABLE = False
 
 # -----------------------------------------------------------------------------
 # Config & Constants
@@ -172,11 +179,11 @@ def import_watchlist_as_rules() -> list[dict]:
 # -----------------------------------------------------------------------------
 # Async Scan Engine (fetch only required strategies per symbol)
 # -----------------------------------------------------------------------------
-async def _scan_once_async(rules: list[dict], min_dte: int, max_dte: int) -> pd.DataFrame:
+async def _scan_once_async(rules: list[dict], min_dte: int, max_dte: int) -> tuple[pd.DataFrame, pd.DataFrame]:
     token = st.secrets.get("api", {}).get("marketdata_token")
     if not token:
         st.error("MarketData API token missing in secrets.toml.")
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
 
     # Group rules by symbol and collect required strategies per symbol
     by_symbol: dict[str, list[dict]] = {}
@@ -228,7 +235,7 @@ async def _scan_once_async(rules: list[dict], min_dte: int, max_dte: int) -> pd.
 
     # Fetch all symbols concurrently
     if not by_symbol:
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
     results = await asyncio.gather(*(fetch_symbol(sym) for sym in by_symbol.keys()))
 
     # Build final hit list
@@ -283,11 +290,121 @@ async def _scan_once_async(rules: list[dict], min_dte: int, max_dte: int) -> pd.
     except Exception:
         pass
 
-    if not hits:
-        return pd.DataFrame()
-    df = pd.DataFrame(hits)
-    df.sort_values(by=["monthly_yield", "POP", "dte"], ascending=[False, False, True], inplace=True)
-    return df
+    # Build matches DataFrame
+    matches_df = pd.DataFrame(hits) if hits else pd.DataFrame()
+    if not matches_df.empty:
+        matches_df.sort_values(by=["monthly_yield", "POP", "dte"], ascending=[False, False, True], inplace=True)
+
+    # Build not-matched summary per rule at the actual desired strike
+    # Cache fetched rows for each symbol/strategy from earlier gather
+    rows_cache: dict[str, dict[str, list[dict]]] = {sym: rows_map for sym, rows_map in results}
+
+    misses: list[dict] = []
+    for r in rules:
+        if not isinstance(r, dict):
+            continue
+        sym = str(r.get("symbol", "")).strip().upper()
+        if not sym:
+            continue
+        strategy = str(r.get("strategy", DEFAULT_STRATEGY)).strip().upper()
+        if strategy not in ("PUT", "CALL"):
+            strategy = DEFAULT_STRATEGY
+        desired = float(r.get("desired_strike", 0) or 0)
+        min_yield_rule = float(r.get("min_monthly_yield", 0) or 0)
+
+        # Determine if this rule had any hits
+        had_hit = False
+        if not matches_df.empty:
+            m = (matches_df["symbol"].str.upper() == sym) & (matches_df["strategy"].str.upper() == strategy)
+            if desired > 0:
+                if strategy == "PUT":
+                    m = m & (matches_df["strike"] <= desired)
+                else:
+                    m = m & (matches_df["strike"] >= desired)
+            had_hit = bool(not matches_df[m].empty)
+        if had_hit:
+            continue
+
+        # Only compute a miss row when a concrete desired strike is provided
+        if desired <= 0:
+            continue
+
+        # Get pre-fetched rows for this symbol/strategy; if missing, fetch now
+        rows_for_rule: list[dict] = []
+        try:
+            rows_for_rule = (rows_cache.get(sym, {}) or {}).get(strategy, [])
+        except Exception:
+            rows_for_rule = []
+
+        if not rows_for_rule:
+            # Fetch minimal snapshot for this symbol/strategy
+            try:
+                token2 = st.secrets.get("api", {}).get("marketdata_token")
+                client2 = MarketDataClient(token2) if token2 else None
+                _pivot, rows_tmp = await build_matrix(
+                    symbol=sym,
+                    client=client2,
+                    strategy=strategy,
+                    target_delta=cfg.get("TARGET_DELTA", 0.3),
+                    min_dte=min_dte,
+                    max_dte=max_dte,
+                    feed_type="cached",
+                    cache_ttl=60,
+                )
+                rows_for_rule = rows_tmp or []
+                try:
+                    if client2:
+                        await client2.close()
+                except Exception:
+                    pass
+            except Exception:
+                rows_for_rule = []
+
+        # Filter to rows exactly at the desired strike (tolerate minor float diffs)
+        rows_at_desired = []
+        for o in rows_for_rule:
+            try:
+                if abs(float(o.get("strike", 0) or 0) - desired) <= 1e-6:
+                    rows_at_desired.append(o)
+            except Exception:
+                continue
+
+        if not rows_at_desired:
+            # No exact strike found; skip per spec (no synthetic strike)
+            continue
+
+        # Pick expiry with highest monthly_yield for the desired strike
+        try:
+            best_row = max(rows_at_desired, key=lambda x: float(x.get("monthly_yield", 0) or 0))
+        except Exception:
+            continue
+
+        # Compose miss entry: monthly_yield at desired_strike vs the rule's min_monthly_yield
+        try:
+            misses.append({
+                "symbol": sym,
+                "strategy": strategy,
+                "expiry": best_row.get("expiry"),
+                "dte": int(best_row.get("dte", 0) or 0),
+                "desired_strike": float(desired),
+                "monthly_yield": round(float(best_row.get("monthly_yield", 0) or 0), 2),
+                "min_monthly_yield": round(min_yield_rule, 2),
+                "POP": round(float(best_row.get("POP", 0) or 0), 1),
+                "premium($)": round(float(best_row.get("premium_dollars", 0) or 0), 2),
+                "price_used": float(best_row.get("Price Used", 0) or 0),
+                "method": str(best_row.get("Price Method", "")),
+                "iv(%)": round(float(best_row.get("iv", 0) or 0), 1),
+                "breakeven": round(float(best_row.get("breakeven", 0) or 0), 2),
+                "breakeven_%": round(float(best_row.get("breakeven_pct", 0) or 0), 2),
+            })
+        except Exception:
+            continue
+
+    misses_df = pd.DataFrame(misses) if misses else pd.DataFrame()
+    if not misses_df.empty:
+        misses_df.sort_values(by=["symbol", "monthly_yield", "POP", "dte"], ascending=[True, False, False, True], inplace=True)
+
+    return matches_df, misses_df
 
 # Refresh only the current matches using live feed (sip), bypassing cache.
 async def _refresh_matches_live(matches: pd.DataFrame, min_dte: int, max_dte: int) -> pd.DataFrame:
@@ -374,7 +491,7 @@ async def _refresh_matches_live(matches: pd.DataFrame, min_dte: int, max_dte: in
                         BE = (K + price_used) if strat=='CALL' else max(K - price_used, 1e-9)
                         try:
                             d2 = (math.log(spot/BE) + (R - 0.5*iv_val**2)*T) / (iv_val*math.sqrt(T)) if iv_val>0 and T>0 else 0.0
-                            pop = (1 - norm.cdf(d2)) if strat=='CALL' else norm.cdf(d2)
+                            pop = (1 - _norm_cdf(d2)) if strat=='CALL' else _norm_cdf(d2)
                             pop = max(0.0, min(pop, 1.0))
                         except Exception:
                             pop = 0.0
@@ -474,8 +591,17 @@ with sp_col1:
 st.markdown("---")
 
 st.subheader("Scanner Rules")
-with st.form("rules_form"):
-    # Normalize existing rules so 'min_pop' is always present in the editor
+# Toggle for showing the read-only rules table (hidden by default)
+if "show_rules_readonly" not in st.session_state:
+    st.session_state.show_rules_readonly = False
+st.session_state.show_rules_readonly = st.checkbox(
+    "Show Rules (read-only, sortable)",
+    value=st.session_state.show_rules_readonly,
+    help="Toggle to show/hide the read-only, sortable view of your rules.",
+    key="show_rules_readonly_toggle",
+)
+if AGGRID_AVAILABLE:
+    # Build normalized DataFrame
     normalized_rules: list[dict] = []
     for r in (st.session_state.scanner_rules or []):
         if isinstance(r, dict):
@@ -490,28 +616,103 @@ with st.form("rules_form"):
                     "strategy": strat_val,
                 }
             )
-    rules_df = st.data_editor(
-        pd.DataFrame(normalized_rules),
-        key="rules_editor",
-        num_rows="dynamic",
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "symbol": st.column_config.TextColumn("Symbol", help="Ticker symbol (e.g., SPY)"),
-            "desired_strike": st.column_config.NumberColumn("Desired Strike", help="0 to ignore strike filter", step=0.5),
-            "min_monthly_yield": st.column_config.NumberColumn("Min Monthly Yield %", help="0 to ignore yield filter", step=0.1, min_value=0.0, max_value=100.0),
-            "min_pop": st.column_config.NumberColumn("Min POP %", help="0 to ignore POP filter", step=1.0, min_value=0.0, max_value=100.0),
-            "strategy": st.column_config.SelectboxColumn("Strategy", options=["PUT", "CALL"]),
-        },
-    )
-    fcol1, fcol2 = st.columns([1, 1])
-    save_clicked = fcol1.form_submit_button("💾 Save Rules", type="primary")
-    import_clicked = fcol2.form_submit_button("📥 Import Watchlist")
 
+    # Session state storage for grid data
+    if "rules_grid_data" not in st.session_state:
+        st.session_state.rules_grid_data = normalized_rules
+
+    # Allow adding a blank row
+    ac1, ac2, ac3 = st.columns([1, 1, 4])
+    with ac1:
+        if st.button("➕ Add Row"):
+            st.session_state.rules_grid_data = (st.session_state.rules_grid_data or []) + [
+                {"symbol": "", "desired_strike": 0.0, "min_monthly_yield": 0.0, "min_pop": 0.0, "strategy": DEFAULT_STRATEGY}
+            ]
+            st.rerun()
+    with ac2:
+        import_clicked = st.button("📥 Import Watchlist")
+
+    df_init = pd.DataFrame(st.session_state.rules_grid_data or [])
+
+    # Configure AgGrid: editable + sortable columns
+    gb = GridOptionsBuilder.from_dataframe(df_init)
+    gb.configure_default_column(editable=True, sortable=True, filter=True, resizable=True)
+    gb.configure_selection(selection_mode="multiple", use_checkbox=True)
+    gb.configure_column("symbol", header_name="Symbol")
+    gb.configure_column("desired_strike", header_name="Desired Strike", type=["numericColumn"], precision=2)
+    gb.configure_column("min_monthly_yield", header_name="Min Monthly Yield %", type=["numericColumn"], precision=1)
+    gb.configure_column("min_pop", header_name="Min POP %", type=["numericColumn"], precision=0)
+    gb.configure_column(
+        "strategy",
+        header_name="Strategy",
+        editable=True,
+        cellEditor="agSelectCellEditor",
+        cellEditorParams={"values": ["PUT", "CALL"]},
+    )
+    gridOptions = gb.build()
+
+    grid_response = AgGrid(
+        df_init,
+        gridOptions=gridOptions,
+        data_return_mode=DataReturnMode.AS_INPUT,
+        update_mode=GridUpdateMode.MODEL_CHANGED,
+        fit_columns_on_grid_load=True,
+        enable_enterprise_modules=False,
+        height=320,
+    )
+
+    # Buttons for Save/Delete
+    sc1, sc2, sc3 = st.columns([1, 1, 4])
+    with sc1:
+        save_clicked = st.button("💾 Save Rules", type="primary")
+    with sc2:
+        delete_clicked = st.button("🗑️ Delete Selected")
+
+    # Handle Import Watchlist
+    if import_clicked:
+        imported = import_watchlist_as_rules()
+        if imported:
+            existing_syms = {str(r.get("symbol", "")).strip().upper() for r in (st.session_state.rules_grid_data or []) if isinstance(r, dict)}
+            to_add = [
+                {
+                    "symbol": str(r.get("symbol", "")).strip().upper(),
+                    "desired_strike": float(r.get("desired_strike", 0) or 0),
+                    "min_monthly_yield": float(r.get("min_monthly_yield", 0) or 0),
+                    "min_pop": float(r.get("min_pop", 0) or 0),
+                    "strategy": str(r.get("strategy", DEFAULT_STRATEGY)).strip().upper() if str(r.get("strategy", DEFAULT_STRATEGY)).strip().upper() in ("PUT", "CALL") else DEFAULT_STRATEGY,
+                }
+                for r in imported
+                if isinstance(r, dict) and str(r.get("symbol", "")).strip().upper() not in existing_syms
+            ]
+            if to_add:
+                st.session_state.rules_grid_data = (st.session_state.rules_grid_data or []) + to_add
+                st.success(f"Added {len(to_add)} new ticker(s) from watchlist.")
+                st.rerun()
+            else:
+                st.info("No new tickers to add from watchlist.")
+        else:
+            st.info("No watchlist found or import failed.")
+
+    # Delete selected rows (in-session only)
+    if delete_clicked:
+        selected = pd.DataFrame(grid_response.get("selected_rows") or [])
+        base_df = pd.DataFrame(grid_response.get("data") or [])
+        if not selected.empty and not base_df.empty:
+            # Drop by index if present; else by matching rows
+            sel_idx = selected.get("_selectedRowNodeInfo").apply(lambda x: x.get("nodeRowIndex") if isinstance(x, dict) else None) if "_selectedRowNodeInfo" in selected.columns else None
+            if sel_idx is not None and sel_idx.notna().any():
+                remaining = base_df.drop(index=sel_idx.dropna().astype(int), errors="ignore")
+            else:
+                remaining = pd.concat([base_df, selected, selected]).drop_duplicates(keep=False)
+            st.session_state.rules_grid_data = remaining.to_dict(orient="records")
+            st.rerun()
+
+    # Save current grid data
     if save_clicked:
+        df_out = pd.DataFrame(grid_response.get("data") or [])
         # Normalize and store back into session (preserve duplicates and order)
         new_rules: list[dict] = []
-        for _, row in rules_df.fillna(0).iterrows():
+        for _, row in df_out.fillna(0).iterrows():
             sym = str(row.get("symbol", "")).strip().upper()
             strat = str(row.get("strategy", DEFAULT_STRATEGY)).strip().upper()
             if strat not in ("PUT", "CALL"):
@@ -525,26 +726,102 @@ with st.form("rules_form"):
                     "strategy": strat,
                 }
             )
+        st.session_state.rules_grid_data = new_rules
         st.session_state.scanner_rules = new_rules
         if save_rules(st.session_state.scanner_rules):
             st.success("Rules saved.")
         else:
             st.warning("Failed to save rules (see logs).")
+else:
+    # Fallback to Streamlit data_editor within a form
+    with st.form("rules_form"):
+        normalized_rules: list[dict] = []
+        for r in (st.session_state.scanner_rules or []):
+            if isinstance(r, dict):
+                strat_val = str(r.get("strategy", DEFAULT_STRATEGY)).strip().upper()
+                strat_val = strat_val if strat_val in ("PUT", "CALL") else DEFAULT_STRATEGY
+                normalized_rules.append(
+                    {
+                        "symbol": str(r.get("symbol", "")).strip().upper(),
+                        "desired_strike": float(r.get("desired_strike", 0) or 0),
+                        "min_monthly_yield": float(r.get("min_monthly_yield", 0) or 0),
+                        "min_pop": float(r.get("min_pop", 0) or 0),
+                        "strategy": strat_val,
+                    }
+                )
+        rules_df = st.data_editor(
+            pd.DataFrame(normalized_rules),
+            key="rules_editor",
+            num_rows="dynamic",
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "symbol": st.column_config.TextColumn("Symbol", help="Ticker symbol (e.g., SPY)"),
+                "desired_strike": st.column_config.NumberColumn("Desired Strike", help="0 to ignore strike filter", step=0.5),
+                "min_monthly_yield": st.column_config.NumberColumn("Min Monthly Yield %", help="0 to ignore yield filter", step=0.1, min_value=0.0, max_value=100.0),
+                "min_pop": st.column_config.NumberColumn("Min POP %", help="0 to ignore POP filter", step=1.0, min_value=0.0, max_value=100.0),
+                "strategy": st.column_config.SelectboxColumn("Strategy", options=["PUT", "CALL"]),
+            },
+        )
+        fcol1, fcol2 = st.columns([1, 1])
+        save_clicked = fcol1.form_submit_button("💾 Save Rules", type="primary")
+        import_clicked = fcol2.form_submit_button("📥 Import Watchlist")
 
-    if import_clicked:
-        imported = import_watchlist_as_rules()
-        if imported:
-            # Merge: add only new symbols; keep existing entries intact
-            existing_syms = {str(r.get("symbol", "")).strip().upper() for r in st.session_state.scanner_rules if isinstance(r, dict)}
-            to_add = [r for r in imported if isinstance(r, dict) and str(r.get("symbol", "")).strip().upper() not in existing_syms]
-            if to_add:
-                st.session_state.scanner_rules = (st.session_state.scanner_rules or []) + to_add
-                st.success(f"Added {len(to_add)} new ticker(s) from watchlist.")
-                st.rerun()
+        if save_clicked:
+            new_rules: list[dict] = []
+            for _, row in rules_df.fillna(0).iterrows():
+                sym = str(row.get("symbol", "")).strip().upper()
+                strat = str(row.get("strategy", DEFAULT_STRATEGY)).strip().upper()
+                if strat not in ("PUT", "CALL"):
+                    strat = DEFAULT_STRATEGY
+                new_rules.append(
+                    {
+                        "symbol": sym,
+                        "desired_strike": float(row.get("desired_strike", 0) or 0),
+                        "min_monthly_yield": float(row.get("min_monthly_yield", 0) or 0),
+                        "min_pop": float(row.get("min_pop", 0) or 0),
+                        "strategy": strat,
+                    }
+                )
+            st.session_state.scanner_rules = new_rules
+            if save_rules(st.session_state.scanner_rules):
+                st.success("Rules saved.")
             else:
-                st.info("No new tickers to add from watchlist.")
+                st.warning("Failed to save rules (see logs).")
+
+        if import_clicked:
+            imported = import_watchlist_as_rules()
+            if imported:
+                existing_syms = {str(r.get("symbol", "")).strip().upper() for r in st.session_state.scanner_rules if isinstance(r, dict)}
+                to_add = [r for r in imported if isinstance(r, dict) and str(r.get("symbol", "")).strip().upper() not in existing_syms]
+                if to_add:
+                    st.session_state.scanner_rules = (st.session_state.scanner_rules or []) + to_add
+                    st.success(f"Added {len(to_add)} new ticker(s) from watchlist.")
+                    st.rerun()
+                else:
+                    st.info("No new tickers to add from watchlist.")
+            else:
+                st.info("No watchlist found or import failed.")
+
+    # Read-only sortable view of current rules (hidden unless toggled on)
+    if st.session_state.get("show_rules_readonly", False) or st.session_state.get("show_rules_readonly_toggle", False):
+        st.caption("Rules (read-only, sortable)")
+        display_df = pd.DataFrame(st.session_state.scanner_rules or [])
+        if isinstance(display_df, pd.DataFrame) and not display_df.empty:
+            st.dataframe(
+                display_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "symbol": st.column_config.TextColumn("Symbol"),
+                    "desired_strike": st.column_config.NumberColumn("Desired Strike", format="%.2f"),
+                    "min_monthly_yield": st.column_config.NumberColumn("Min Monthly Yield %", format="%.1f"),
+                    "min_pop": st.column_config.NumberColumn("Min POP %", format="%d"),
+                    "strategy": st.column_config.TextColumn("Strategy"),
+                },
+            )
         else:
-            st.info("No watchlist found or import failed.")
+            st.info("No rules to display.")
 
 col3, col4 = st.columns([1.8, 3])
 
@@ -565,8 +842,11 @@ st.markdown("---")
 
 if "results_df" not in st.session_state:
     st.session_state.results_df = pd.DataFrame()
+if "misses_df" not in st.session_state:
+    st.session_state.misses_df = pd.DataFrame()
 
-results_df = pd.DataFrame()
+matches_df = pd.DataFrame()
+misses_df = pd.DataFrame()
 if run_scan:
     # Validate DTE window
     _min = int(st.session_state.get("min_dte", 0))
@@ -578,20 +858,22 @@ if run_scan:
         with st.spinner("Scanning..."):
             try:
                 loop = asyncio.get_event_loop()
-                results_df = loop.run_until_complete(_scan_once_async(st.session_state.scanner_rules, _min, _max))
+                matches_df, misses_df = loop.run_until_complete(_scan_once_async(st.session_state.scanner_rules, _min, _max))
             except RuntimeError:
                 # Fallback if loop state is odd
-                results_df = asyncio.run(_scan_once_async(st.session_state.scanner_rules, _min, _max))
+                matches_df, misses_df = asyncio.run(_scan_once_async(st.session_state.scanner_rules, _min, _max))
             except Exception as e:
                 st.error(f"Scan error: {e}")
-                results_df = pd.DataFrame()
+                matches_df, misses_df = pd.DataFrame(), pd.DataFrame()
     # Persist results for UI reruns
-    st.session_state.results_df = results_df.copy()
+    st.session_state.results_df = matches_df.copy()
+    st.session_state.misses_df = misses_df.copy()
 else:
     # Use last results so toggles (which cause reruns) don't clear the table
-    results_df = st.session_state.get("results_df", pd.DataFrame())
+    matches_df = st.session_state.get("results_df", pd.DataFrame())
+    misses_df = st.session_state.get("misses_df", pd.DataFrame())
 
-if not results_df.empty:
+if not matches_df.empty:
     # Offer live refresh for current matches only
     lcol1, lcol2 = st.columns([3, 1])
     with lcol2:
@@ -602,16 +884,16 @@ if not results_df.empty:
         with st.spinner("Refreshing matches with live data..."):
             try:
                 loop = asyncio.get_event_loop()
-                live_df = loop.run_until_complete(_refresh_matches_live(results_df, min_dte, max_dte))
+                live_df = loop.run_until_complete(_refresh_matches_live(matches_df, min_dte, max_dte))
             except RuntimeError:
-                live_df = asyncio.run(_refresh_matches_live(results_df, min_dte, max_dte))
+                live_df = asyncio.run(_refresh_matches_live(matches_df, min_dte, max_dte))
             except Exception as e:
                 st.error(f"Live refresh error: {e}")
                 live_df = pd.DataFrame()
 
     # Ensure live_df is defined across reruns
     live_df = st.session_state.get("live_df", None)
-    display_df = live_df if (live_df is not None and not live_df.empty) else results_df
+    display_df = live_df if (live_df is not None and not live_df.empty) else matches_df
     st.subheader("Matches (Live)" if live_df is not None else "Matches")
 
     # Toggle grouped view for readability
@@ -676,5 +958,142 @@ if not results_df.empty:
         file_name=("scanner_results_live.csv" if live_df is not None else "scanner_results.csv"),
         mime="text/csv",
     )
+    st.markdown("---")
+    # Not Matched section
+    st.subheader("Not Matched")
+    if misses_df is not None and not misses_df.empty:
+        n_colcfg = {
+            "monthly_yield": st.column_config.NumberColumn("Monthly Yield %", format="%.2f"),
+            "min_monthly_yield": st.column_config.NumberColumn("Min Monthly Yield %", format="%.2f"),
+            "POP": st.column_config.NumberColumn("POP %", format="%.1f"),
+            "iv(%)": st.column_config.NumberColumn("IV %", format="%.1f"),
+            "premium($)": st.column_config.NumberColumn("Premium $", format="%.2f"),
+            "breakeven_%": st.column_config.NumberColumn("Breakeven %", format="%.2f"),
+            "breakeven": st.column_config.NumberColumn("Breakeven $", format="%.2f"),
+            "price_used": st.column_config.NumberColumn("Price Used $", format="%.2f"),
+            "dte": st.column_config.NumberColumn("DTE", format="%d"),
+            "desired_strike": st.column_config.NumberColumn("Desired Strike", format="%.2f"),
+        }
+        desired_cols2 = [
+            "strategy", "expiry", "dte", "desired_strike",
+            "monthly_yield", "min_monthly_yield", "POP", "premium($)", "iv(%)",
+            "breakeven", "breakeven_%", "price_used", "method",
+        ]
+        exists2 = [c for c in desired_cols2 if c in misses_df.columns]
+        # Toggle grouped view similar to Matches
+        ng1, ng2 = st.columns([1.5, 1])
+        with ng1:
+            n_grouped_view = st.checkbox("Group by ticker (expand/collapse)", value=True, key="misses_grouped_view")
+        with ng2:
+            n_expand_all = st.checkbox("Expand all", value=(misses_df["symbol"].nunique() == 1), disabled=not n_grouped_view, key="misses_expand_all")
+
+        if not n_grouped_view:
+            view2 = misses_df.copy().sort_values(by=["symbol", "monthly_yield", "POP", "dte"], ascending=[True, False, False, True])
+            if exists2:
+                view2 = view2[["symbol"] + exists2] if "symbol" in view2.columns else view2[exists2]
+            st.dataframe(view2, use_container_width=True, hide_index=True, column_config=n_colcfg)
+        else:
+            for sym in sorted(misses_df["symbol"].unique()):
+                sub = misses_df[misses_df["symbol"] == sym].copy()
+                sub = sub.sort_values(by=["monthly_yield", "POP", "dte"], ascending=[False, False, True])
+                expander = st.expander(f"{sym} • {len(sub)} candidates", expanded=n_expand_all)
+                with expander:
+                    strategies = [s for s in ["PUT", "CALL"] if s in set(sub.get("strategy", "PUT"))] or ["PUT"]
+                    if len(strategies) > 1:
+                        tabs = st.tabs(strategies)
+                        for t, strat in zip(tabs, strategies):
+                            with t:
+                                v = sub[sub.get("strategy", "PUT") == strat]
+                                if exists2:
+                                    v = v[["symbol"] + exists2] if "symbol" in v.columns else v[exists2]
+                                st.dataframe(v, use_container_width=True, hide_index=True, column_config=n_colcfg)
+                    else:
+                        v = sub
+                        if exists2:
+                            v = v[["symbol"] + exists2] if "symbol" in v.columns else v[exists2]
+                        st.dataframe(v, use_container_width=True, hide_index=True, column_config=n_colcfg)
+
+        # CSV download for Not Matched (flat)
+        csv2 = misses_df.sort_values(by=["symbol", "monthly_yield", "POP", "dte"], ascending=[True, False, False, True]).to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Download Not-Matched CSV",
+            data=csv2,
+            file_name="scanner_not_matched.csv",
+            mime="text/csv",
+        )
+    else:
+        st.info("No unmatched tickers to show.")
 else:
-    st.info("No matches yet. Edit rules and click Run Scan.")
+    # Even if no matches, show Not Matched if available
+    if misses_df is not None and not misses_df.empty:
+        st.subheader("Not Matched")
+        n_colcfg = {
+            "monthly_yield": st.column_config.NumberColumn("Monthly Yield %", format="%.2f"),
+            "min_monthly_yield": st.column_config.NumberColumn("Min Monthly Yield %", format="%.2f"),
+            "POP": st.column_config.NumberColumn("POP %", format="%.1f"),
+            "iv(%)": st.column_config.NumberColumn("IV %", format="%.1f"),
+            "premium($)": st.column_config.NumberColumn("Premium $", format="%.2f"),
+            "breakeven_%": st.column_config.NumberColumn("Breakeven %", format="%.2f"),
+            "breakeven": st.column_config.NumberColumn("Breakeven $", format="%.2f"),
+            "price_used": st.column_config.NumberColumn("Price Used $", format="%.2f"),
+            "dte": st.column_config.NumberColumn("DTE", format="%d"),
+            "desired_strike": st.column_config.NumberColumn("Desired Strike", format="%.2f"),
+        }
+        desired_cols2 = [
+            "strategy", "expiry", "dte", "desired_strike",
+            "monthly_yield", "min_monthly_yield", "POP", "premium($)", "iv(%)",
+            "breakeven", "breakeven_%", "price_used", "method",
+        ]
+        exists2 = []
+        try:
+            exists2 = [c for c in desired_cols2 if c in misses_df.columns]
+        except Exception:
+            exists2 = []
+        # Toggle grouped view similar to Matches
+        ng1, ng2 = st.columns([1.5, 1])
+        with ng1:
+            n_grouped_view = st.checkbox("Group by ticker (expand/collapse)", value=True, key="misses_grouped_view_nomatch")
+        with ng2:
+            n_expand_all = st.checkbox("Expand all", value=(misses_df["symbol"].nunique() == 1), disabled=not n_grouped_view, key="misses_expand_all_nomatch")
+
+        if not n_grouped_view:
+            view2 = misses_df.copy().sort_values(by=["symbol", "monthly_yield", "POP", "dte"], ascending=[True, False, False, True]) if isinstance(misses_df, pd.DataFrame) else pd.DataFrame()
+            if isinstance(view2, pd.DataFrame) and not view2.empty and exists2:
+                view2 = view2[["symbol"] + exists2] if "symbol" in view2.columns else view2[exists2]
+            if isinstance(view2, pd.DataFrame) and not view2.empty:
+                st.dataframe(view2, use_container_width=True, hide_index=True, column_config=n_colcfg)
+        else:
+            if isinstance(misses_df, pd.DataFrame) and not misses_df.empty:
+                for sym in sorted(misses_df["symbol"].unique()):
+                    sub = misses_df[misses_df["symbol"] == sym].copy()
+                    sub = sub.sort_values(by=["monthly_yield", "POP", "dte"], ascending=[False, False, True])
+                    expander = st.expander(f"{sym} • {len(sub)} candidates", expanded=n_expand_all)
+                    with expander:
+                        strategies = [s for s in ["PUT", "CALL"] if s in set(sub.get("strategy", "PUT"))] or ["PUT"]
+                        if len(strategies) > 1:
+                            tabs = st.tabs(strategies)
+                            for t, strat in zip(tabs, strategies):
+                                with t:
+                                    v = sub[sub.get("strategy", "PUT") == strat]
+                                    if exists2:
+                                        v = v[["symbol"] + exists2] if "symbol" in v.columns else v[exists2]
+                                    st.dataframe(v, use_container_width=True, hide_index=True, column_config=n_colcfg)
+                        else:
+                            v = sub
+                            if exists2:
+                                v = v[["symbol"] + exists2] if "symbol" in v.columns else v[exists2]
+                            st.dataframe(v, use_container_width=True, hide_index=True, column_config=n_colcfg)
+
+        # CSV download for Not Matched (flat)
+        if isinstance(misses_df, pd.DataFrame) and not misses_df.empty:
+            csv2 = misses_df.sort_values(by=["symbol", "monthly_yield", "POP", "dte"], ascending=[True, False, False, True]).to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇️ Download Not-Matched CSV",
+                data=csv2,
+                file_name="scanner_not_matched.csv",
+                mime="text/csv",
+            )
+        else:
+            st.info("No unmatched tickers to show.")
+    else:
+        st.info("No matches yet. Edit rules and click Run Scan.")

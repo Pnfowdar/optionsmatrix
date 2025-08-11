@@ -2,6 +2,9 @@ docker compose down
 docker compose build --no-cache
 docker compose up -d
 
+Windsurf:
+docker compose up --build
+
 
 .\venv\Scripts\Activate.ps1
 streamlit run app.py
