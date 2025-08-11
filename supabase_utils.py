@@ -18,6 +18,10 @@ ROW_ID = "default"  # single-row storage for this app instance
 SCANNER_TABLE_NAME = "scanner_rules"
 SCANNER_ROW_ID = ROW_ID  # reuse same default id
 
+# --- Scanner Preferences (Supabase) ---
+PREFS_TABLE_NAME = "scanner_prefs"
+PREFS_ROW_ID = ROW_ID
+
 
 def _get_supabase_client() -> Optional["Client"]:
     """Return a Supabase client if credentials exist and library is installed."""
@@ -143,4 +147,45 @@ def save_scanner_rules_supabase(rules: list[dict]) -> bool:
         return True
     except Exception as e:
         print(f"ERROR [supabase_utils.save_scanner_rules] {e}")
+        return False
+
+
+def load_scanner_prefs_supabase() -> Dict[str, Any]:
+    """Load scanner preferences (e.g., min_dte, max_dte) from Supabase.
+
+    Expected row shape: { id: TEXT, prefs: JSONB(object) }
+    Returns an empty dict on error or if none found.
+    """
+    client = _get_supabase_client()
+    if client is None:
+        return {}
+    try:
+        res = client.table(PREFS_TABLE_NAME).select("id,prefs").eq("id", PREFS_ROW_ID).execute()
+        data = getattr(res, "data", None) or []
+        if not data:
+            return {}
+        row = data[0]
+        prefs = row.get("prefs")
+        if isinstance(prefs, str):
+            try:
+                prefs = json.loads(prefs)
+            except Exception:
+                return {}
+        return prefs if isinstance(prefs, dict) else {}
+    except Exception as e:
+        print(f"WARN [supabase_utils.load_scanner_prefs] {e}")
+        return {}
+
+
+def save_scanner_prefs_supabase(prefs: Dict[str, Any]) -> bool:
+    """Upsert scanner preferences into Supabase. Returns True on success."""
+    client = _get_supabase_client()
+    if client is None:
+        return False
+    try:
+        payload = {"id": PREFS_ROW_ID, "prefs": dict(prefs or {})}
+        client.table(PREFS_TABLE_NAME).upsert(payload, on_conflict="id").execute()
+        return True
+    except Exception as e:
+        print(f"ERROR [supabase_utils.save_scanner_prefs] {e}")
         return False

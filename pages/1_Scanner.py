@@ -21,6 +21,8 @@ from supabase_utils import (
     supabase_available,
     load_scanner_rules_supabase,
     save_scanner_rules_supabase,
+    load_scanner_prefs_supabase,
+    save_scanner_prefs_supabase,
 )
 
 # -----------------------------------------------------------------------------
@@ -35,6 +37,7 @@ except Exception:
 APP_ROOT = Path(__file__).resolve().parent.parent
 LOCAL_RULES_FILE = APP_ROOT / "scanner_rules.json"
 LOCAL_WATCHLIST_FILE = APP_ROOT / "watchlist.json"
+LOCAL_PREFS_FILE = APP_ROOT / "scanner_prefs.json"
 DEFAULT_STRATEGY = "PUT"
 
 # -----------------------------------------------------------------------------
@@ -87,6 +90,52 @@ def save_rules(rules: list[dict]) -> bool:
     return ok_remote and ok_local
 
 
+# --- Preferences (Min/Max DTE) persistence ---
+def _load_prefs_local() -> dict:
+    try:
+        if LOCAL_PREFS_FILE.exists():
+            data = json.loads(LOCAL_PREFS_FILE.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"WARN [Scanner._load_prefs_local] {e}")
+    return {}
+
+
+def _save_prefs_local(prefs: dict) -> bool:
+    try:
+        LOCAL_PREFS_FILE.write_text(json.dumps(prefs or {}, indent=2), encoding="utf-8")
+        return True
+    except Exception as e:
+        print(f"WARN [Scanner._save_prefs_local] {e}")
+        return False
+
+
+def load_prefs() -> dict:
+    # Try Supabase first
+    if supabase_available():
+        try:
+            remote = load_scanner_prefs_supabase()
+            if isinstance(remote, dict) and remote:
+                _save_prefs_local(remote)  # mirror to local
+                return remote
+        except Exception as e:
+            print(f"WARN [Scanner.load_prefs] Supabase error, falling back to file: {e}")
+    # Local fallback
+    return _load_prefs_local()
+
+
+def save_prefs(prefs: dict) -> bool:
+    ok_remote = True
+    if supabase_available():
+        try:
+            ok_remote = save_scanner_prefs_supabase(prefs)
+        except Exception as e:
+            print(f"WARN [Scanner.save_prefs] Supabase save failed: {e}")
+            ok_remote = False
+    ok_local = _save_prefs_local(prefs)
+    return ok_remote and ok_local
+
+
 def import_watchlist_as_rules() -> list[dict]:
     try:
         if LOCAL_WATCHLIST_FILE.exists():
@@ -98,6 +147,7 @@ def import_watchlist_as_rules() -> list[dict]:
                         "symbol": str(t).strip().upper(),
                         "desired_strike": 0.0,
                         "min_monthly_yield": 3.0,
+                        "min_pop": 0.0,
                         "strategy": DEFAULT_STRATEGY,
                     }
                     for t in tickers
@@ -178,6 +228,7 @@ async def _scan_once_async(rules: list[dict], min_dte: int, max_dte: int) -> pd.
         for rule in by_symbol.get(sym, []):
             desired_strike = float(rule.get("desired_strike", 0) or 0)
             min_yield = float(rule.get("min_monthly_yield", 0) or 0)
+            min_pop = float(rule.get("min_pop", 0) or 0)
             strategy = str(rule.get("strategy", DEFAULT_STRATEGY)).upper()
             if strategy not in ("PUT", "CALL"):
                 strategy = DEFAULT_STRATEGY
@@ -193,7 +244,8 @@ async def _scan_once_async(rules: list[dict], min_dte: int, max_dte: int) -> pd.
                 try:
                     k = float(o.get("strike", 0) or 0)
                     y = float(o.get("monthly_yield", 0) or 0)
-                    if strike_ok(k) and y >= min_yield:
+                    p = float(o.get("POP", 0) or 0)
+                    if strike_ok(k) and y >= min_yield and p >= min_pop:
                         rec = {
                             "symbol": sym,
                             "strategy": strategy,
@@ -201,7 +253,7 @@ async def _scan_once_async(rules: list[dict], min_dte: int, max_dte: int) -> pd.
                             "dte": int(o.get("dte", 0) or 0),
                             "strike": k,
                             "monthly_yield": round(y, 2),
-                            "POP": float(o.get("POP", 0) or 0),
+                            "POP": p,
                             "delta": float(o.get("delta", 0) or 0),
                             "premium($)": float(o.get("premium_dollars", 0) or 0),
                             "price_used": float(o.get("Price Used", 0) or 0),
@@ -363,22 +415,71 @@ st.title("🔎 Scanner")
 # Initialize session state for rules
 if "scanner_rules" not in st.session_state:
     st.session_state.scanner_rules = load_rules() or [
-        {"symbol": "SPY", "desired_strike": 0.0, "min_monthly_yield": 3.0, "strategy": DEFAULT_STRATEGY}
+        {"symbol": "SPY", "desired_strike": 0.0, "min_monthly_yield": 3.0, "min_pop": 0.0, "strategy": DEFAULT_STRATEGY}
     ]
 
 # Controls
+# Provide optional scanner-specific overrides with session persistence
+# Prefs from Supabase/local take precedence, then SCANNER_MIN_DTE, then MIN_DTE.
+prefs = {}
+try:
+    prefs = load_prefs() or {}
+except Exception:
+    prefs = {}
+default_min_dte = int(prefs.get("min_dte", cfg.get("SCANNER_MIN_DTE", cfg.get("MIN_DTE", 2))))
+default_max_dte = int(prefs.get("max_dte", cfg.get("MAX_DTE", 60)))
+if "min_dte" not in st.session_state:
+    st.session_state.min_dte = default_min_dte
+if "max_dte" not in st.session_state:
+    st.session_state.max_dte = default_max_dte
 col_a, col_b = st.columns(2)
 with col_a:
-    min_dte = st.number_input("Min DTE", min_value=0, max_value=365, value=int(cfg.get("MIN_DTE", 14)))
+    min_dte = st.number_input(
+        "Min DTE",
+        min_value=0,
+        max_value=365,
+        key="min_dte",
+        help="Default comes from SCANNER_MIN_DTE if set, else MIN_DTE."
+    )
 with col_b:
-    max_dte = st.number_input("Max DTE", min_value=min_dte + 1, max_value=730, value=int(cfg.get("MAX_DTE", 60)))
+    max_dte = st.number_input(
+        "Max DTE",
+        min_value=0,
+        max_value=730,
+        key="max_dte"
+    )
+
+# Save current DTE values as preset (Supabase with local fallback)
+sp_col1, sp_col2 = st.columns([1, 3])
+with sp_col1:
+    if st.button("💾 Save Preset (DTE)"):
+        ok = save_prefs({"min_dte": int(st.session_state.min_dte), "max_dte": int(st.session_state.max_dte)})
+        if ok:
+            st.success("Scanner DTE preset saved.")
+        else:
+            st.warning("Failed to save preset (see logs). Using local fallback if available.")
 
 st.markdown("---")
 
 st.subheader("Scanner Rules")
 with st.form("rules_form"):
+    # Normalize existing rules so 'min_pop' is always present in the editor
+    normalized_rules: list[dict] = []
+    for r in (st.session_state.scanner_rules or []):
+        if isinstance(r, dict):
+            strat_val = str(r.get("strategy", DEFAULT_STRATEGY)).strip().upper()
+            strat_val = strat_val if strat_val in ("PUT", "CALL") else DEFAULT_STRATEGY
+            normalized_rules.append(
+                {
+                    "symbol": str(r.get("symbol", "")).strip().upper(),
+                    "desired_strike": float(r.get("desired_strike", 0) or 0),
+                    "min_monthly_yield": float(r.get("min_monthly_yield", 0) or 0),
+                    "min_pop": float(r.get("min_pop", 0) or 0),
+                    "strategy": strat_val,
+                }
+            )
     rules_df = st.data_editor(
-        pd.DataFrame(st.session_state.scanner_rules),
+        pd.DataFrame(normalized_rules),
         key="rules_editor",
         num_rows="dynamic",
         use_container_width=True,
@@ -386,7 +487,8 @@ with st.form("rules_form"):
         column_config={
             "symbol": st.column_config.TextColumn("Symbol", help="Ticker symbol (e.g., SPY)"),
             "desired_strike": st.column_config.NumberColumn("Desired Strike", help="0 to ignore strike filter", step=0.5),
-            "min_monthly_yield": st.column_config.NumberColumn("Min Monthly Yield %", step=0.1),
+            "min_monthly_yield": st.column_config.NumberColumn("Min Monthly Yield %", help="0 to ignore yield filter", step=0.1, min_value=0.0, max_value=100.0),
+            "min_pop": st.column_config.NumberColumn("Min POP %", help="0 to ignore POP filter", step=1.0, min_value=0.0, max_value=100.0),
             "strategy": st.column_config.SelectboxColumn("Strategy", options=["PUT", "CALL"]),
         },
     )
@@ -407,6 +509,7 @@ with st.form("rules_form"):
                     "symbol": sym,
                     "desired_strike": float(row.get("desired_strike", 0) or 0),
                     "min_monthly_yield": float(row.get("min_monthly_yield", 0) or 0),
+                    "min_pop": float(row.get("min_pop", 0) or 0),
                     "strategy": strat,
                 }
             )
@@ -450,16 +553,23 @@ st.markdown("---")
 
 results_df = pd.DataFrame()
 if run_scan:
-    with st.spinner("Scanning..."):
-        try:
-            loop = asyncio.get_event_loop()
-            results_df = loop.run_until_complete(_scan_once_async(st.session_state.scanner_rules, min_dte, max_dte))
-        except RuntimeError:
-            # Fallback if loop state is odd
-            results_df = asyncio.run(_scan_once_async(st.session_state.scanner_rules, min_dte, max_dte))
-        except Exception as e:
-            st.error(f"Scan error: {e}")
-            results_df = pd.DataFrame()
+    # Validate DTE window
+    _min = int(st.session_state.get("min_dte", 0))
+    _max = int(st.session_state.get("max_dte", 0))
+    if _min >= _max:
+        st.error("Min DTE must be less than Max DTE.")
+        results_df = pd.DataFrame()
+    else:
+        with st.spinner("Scanning..."):
+            try:
+                loop = asyncio.get_event_loop()
+                results_df = loop.run_until_complete(_scan_once_async(st.session_state.scanner_rules, _min, _max))
+            except RuntimeError:
+                # Fallback if loop state is odd
+                results_df = asyncio.run(_scan_once_async(st.session_state.scanner_rules, _min, _max))
+            except Exception as e:
+                st.error(f"Scan error: {e}")
+                results_df = pd.DataFrame()
 
 if not results_df.empty:
     # Offer live refresh for current matches only
