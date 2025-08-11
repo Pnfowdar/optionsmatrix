@@ -44,6 +44,18 @@ DEFAULT_STRATEGY = "PUT"
 # Persistence Helpers (local + Supabase)
 # -----------------------------------------------------------------------------
 
+# Ensure full-width layout even if global page_config isn't wide
+st.markdown(
+    """
+    <style>
+    .block-container { max-width: 96% !important; padding-left: 2rem; padding-right: 2rem; }
+    .st-expander { width: 100%; }
+    .stTabs { width: 100%; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 def _load_rules_local() -> list[dict]:
     try:
         if LOCAL_RULES_FILE.exists():
@@ -551,6 +563,9 @@ with col4:
 
 st.markdown("---")
 
+if "results_df" not in st.session_state:
+    st.session_state.results_df = pd.DataFrame()
+
 results_df = pd.DataFrame()
 if run_scan:
     # Validate DTE window
@@ -570,6 +585,11 @@ if run_scan:
             except Exception as e:
                 st.error(f"Scan error: {e}")
                 results_df = pd.DataFrame()
+    # Persist results for UI reruns
+    st.session_state.results_df = results_df.copy()
+else:
+    # Use last results so toggles (which cause reruns) don't clear the table
+    results_df = st.session_state.get("results_df", pd.DataFrame())
 
 if not results_df.empty:
     # Offer live refresh for current matches only
@@ -589,10 +609,72 @@ if not results_df.empty:
                 st.error(f"Live refresh error: {e}")
                 live_df = pd.DataFrame()
 
+    # Ensure live_df is defined across reruns
+    live_df = st.session_state.get("live_df", None)
     display_df = live_df if (live_df is not None and not live_df.empty) else results_df
     st.subheader("Matches (Live)" if live_df is not None else "Matches")
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
-    csv = display_df.to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ Download CSV", data=csv, file_name=("scanner_results_live.csv" if live_df is not None else "scanner_results.csv"), mime="text/csv")
+
+    # Toggle grouped view for readability
+    gcol1, gcol2 = st.columns([1.5, 1])
+    with gcol1:
+        grouped_view = st.checkbox("Group by ticker (expand/collapse)", value=True, key="matches_grouped_view")
+    with gcol2:
+        expand_all = st.checkbox("Expand all", value=(display_df["symbol"].nunique() == 1), disabled=not grouped_view, key="matches_expand_all")
+
+    # Column configuration for readability
+    colcfg = {
+        "monthly_yield": st.column_config.NumberColumn("Monthly Yield %", format="%.2f"),
+        "POP": st.column_config.NumberColumn("POP %", format="%.1f"),
+        "iv(%)": st.column_config.NumberColumn("IV %", format="%.1f"),
+        "premium($)": st.column_config.NumberColumn("Premium $", format="%.2f"),
+        "breakeven_%": st.column_config.NumberColumn("Breakeven %", format="%.2f"),
+        "breakeven": st.column_config.NumberColumn("Breakeven $", format="%.2f"),
+        "price_used": st.column_config.NumberColumn("Price Used $", format="%.2f"),
+        "dte": st.column_config.NumberColumn("DTE", format="%d"),
+        "strike": st.column_config.NumberColumn("Strike", format="%.2f"),
+    }
+
+    # Reorder columns for clarity
+    desired_cols = [
+        "strategy", "expiry", "dte", "strike",
+        "monthly_yield", "POP", "premium($)", "iv(%)",
+        "breakeven", "breakeven_%", "price_used", "method",
+    ]
+    existing_cols = [c for c in desired_cols if c in display_df.columns]
+
+    if not grouped_view:
+        df_flat = display_df.copy()
+        df_flat = df_flat.sort_values(by=["symbol", "monthly_yield", "POP", "dte"], ascending=[True, False, False, True])
+        st.dataframe(df_flat, use_container_width=True, hide_index=True, column_config=colcfg)
+    else:
+        for sym in sorted(display_df["symbol"].unique()):
+            sub = display_df[display_df["symbol"] == sym].copy()
+            sub = sub.sort_values(by=["monthly_yield", "POP", "dte"], ascending=[False, False, True])
+            expander = st.expander(f"{sym} • {len(sub)} matches", expanded=expand_all)
+            with expander:
+                # Tabs per strategy present
+                strategies = [s for s in ["PUT", "CALL"] if s in set(sub.get("strategy", "PUT"))] or ["PUT"]
+                if len(strategies) > 1:
+                    tabs = st.tabs(strategies)
+                    for t, strat in zip(tabs, strategies):
+                        with t:
+                            view = sub[sub.get("strategy", "PUT") == strat]
+                            if existing_cols:
+                                view = view[["symbol"] + existing_cols] if "symbol" in view.columns else view[existing_cols]
+                            st.dataframe(view, use_container_width=True, hide_index=True, column_config=colcfg)
+                else:
+                    view = sub
+                    if existing_cols:
+                        view = view[["symbol"] + existing_cols] if "symbol" in view.columns else view[existing_cols]
+                    st.dataframe(view, use_container_width=True, hide_index=True, column_config=colcfg)
+
+    # Full CSV download of current display set
+    csv = display_df.sort_values(by=["symbol", "monthly_yield", "POP", "dte"], ascending=[True, False, False, True]).to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "⬇️ Download CSV",
+        data=csv,
+        file_name=("scanner_results_live.csv" if live_df is not None else "scanner_results.csv"),
+        mime="text/csv",
+    )
 else:
     st.info("No matches yet. Edit rules and click Run Scan.")
