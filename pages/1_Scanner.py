@@ -733,75 +733,81 @@ if AGGRID_AVAILABLE:
         else:
             st.warning("Failed to save rules (see logs).")
 else:
-    # Fallback to Streamlit data_editor within a form
-    with st.form("rules_form"):
-        normalized_rules: list[dict] = []
-        for r in (st.session_state.scanner_rules or []):
-            if isinstance(r, dict):
-                strat_val = str(r.get("strategy", DEFAULT_STRATEGY)).strip().upper()
-                strat_val = strat_val if strat_val in ("PUT", "CALL") else DEFAULT_STRATEGY
-                normalized_rules.append(
-                    {
-                        "symbol": str(r.get("symbol", "")).strip().upper(),
-                        "desired_strike": float(r.get("desired_strike", 0) or 0),
-                        "min_monthly_yield": float(r.get("min_monthly_yield", 0) or 0),
-                        "min_pop": float(r.get("min_pop", 0) or 0),
-                        "strategy": strat_val,
-                    }
-                )
-        rules_df = st.data_editor(
-            pd.DataFrame(normalized_rules),
-            key="rules_editor",
-            num_rows="dynamic",
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "symbol": st.column_config.TextColumn("Symbol", help="Ticker symbol (e.g., SPY)"),
-                "desired_strike": st.column_config.NumberColumn("Desired Strike", help="0 to ignore strike filter", step=0.5),
-                "min_monthly_yield": st.column_config.NumberColumn("Min Monthly Yield %", help="0 to ignore yield filter", step=0.1, min_value=0.0, max_value=100.0),
-                "min_pop": st.column_config.NumberColumn("Min POP %", help="0 to ignore POP filter", step=1.0, min_value=0.0, max_value=100.0),
-                "strategy": st.column_config.SelectboxColumn("Strategy", options=["PUT", "CALL"]),
-            },
-        )
-        fcol1, fcol2 = st.columns([1, 1])
-        save_clicked = fcol1.form_submit_button("💾 Save Rules", type="primary")
-        import_clicked = fcol2.form_submit_button("📥 Import Watchlist")
+    # Fallback to Streamlit data_editor without a form (avoid truncation on submit)
+    # Build normalized initial data from current session rules
+    normalized_rules: list[dict] = []
+    for r in (st.session_state.scanner_rules or []):
+        if isinstance(r, dict):
+            strat_val = str(r.get("strategy", DEFAULT_STRATEGY)).strip().upper()
+            strat_val = strat_val if strat_val in ("PUT", "CALL") else DEFAULT_STRATEGY
+            normalized_rules.append(
+                {
+                    "symbol": str(r.get("symbol", "")).strip().upper(),
+                    "desired_strike": float(r.get("desired_strike", 0) or 0),
+                    "min_monthly_yield": float(r.get("min_monthly_yield", 0) or 0),
+                    "min_pop": float(r.get("min_pop", 0) or 0),
+                    "strategy": strat_val,
+                }
+            )
 
-        if save_clicked:
-            new_rules: list[dict] = []
-            for _, row in rules_df.fillna(0).iterrows():
-                sym = str(row.get("symbol", "")).strip().upper()
-                strat = str(row.get("strategy", DEFAULT_STRATEGY)).strip().upper()
-                if strat not in ("PUT", "CALL"):
-                    strat = DEFAULT_STRATEGY
-                new_rules.append(
-                    {
-                        "symbol": sym,
-                        "desired_strike": float(row.get("desired_strike", 0) or 0),
-                        "min_monthly_yield": float(row.get("min_monthly_yield", 0) or 0),
-                        "min_pop": float(row.get("min_pop", 0) or 0),
-                        "strategy": strat,
-                    }
-                )
-            st.session_state.scanner_rules = new_rules
-            if save_rules(st.session_state.scanner_rules):
-                st.success("Rules saved.")
-            else:
-                st.warning("Failed to save rules (see logs).")
+    rules_df = st.data_editor(
+        pd.DataFrame(normalized_rules),
+        key="rules_editor",
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "symbol": st.column_config.TextColumn("Symbol", help="Ticker symbol (e.g., SPY)"),
+            "desired_strike": st.column_config.NumberColumn("Desired Strike", help="0 to ignore strike filter", step=0.5),
+            "min_monthly_yield": st.column_config.NumberColumn("Min Monthly Yield %", help="0 to ignore yield filter", step=0.1, min_value=0.0, max_value=100.0),
+            "min_pop": st.column_config.NumberColumn("Min POP %", help="0 to ignore POP filter", step=1.0, min_value=0.0, max_value=100.0),
+            "strategy": st.column_config.SelectboxColumn("Strategy", options=["PUT", "CALL"]),
+        },
+    )
 
-        if import_clicked:
-            imported = import_watchlist_as_rules()
-            if imported:
-                existing_syms = {str(r.get("symbol", "")).strip().upper() for r in st.session_state.scanner_rules if isinstance(r, dict)}
-                to_add = [r for r in imported if isinstance(r, dict) and str(r.get("symbol", "")).strip().upper() not in existing_syms]
-                if to_add:
-                    st.session_state.scanner_rules = (st.session_state.scanner_rules or []) + to_add
-                    st.success(f"Added {len(to_add)} new ticker(s) from watchlist.")
-                    st.rerun()
-                else:
-                    st.info("No new tickers to add from watchlist.")
+    bcol1, bcol2 = st.columns([1, 1])
+    save_clicked = bcol1.button("💾 Save Rules", type="primary", key="save_rules_btn")
+    import_clicked = bcol2.button("📥 Import Watchlist", key="import_watchlist_btn")
+
+    if save_clicked:
+        new_rules: list[dict] = []
+        df_to_iter = rules_df if isinstance(rules_df, pd.DataFrame) else pd.DataFrame()
+        for _, row in df_to_iter.fillna(0).iterrows():
+            sym = str(row.get("symbol", "")).strip().upper()
+            if not sym:
+                # Skip empty rows
+                continue
+            strat = str(row.get("strategy", DEFAULT_STRATEGY)).strip().upper()
+            if strat not in ("PUT", "CALL"):
+                strat = DEFAULT_STRATEGY
+            new_rules.append(
+                {
+                    "symbol": sym,
+                    "desired_strike": float(row.get("desired_strike", 0) or 0),
+                    "min_monthly_yield": float(row.get("min_monthly_yield", 0) or 0),
+                    "min_pop": float(row.get("min_pop", 0) or 0),
+                    "strategy": strat,
+                }
+            )
+        st.session_state.scanner_rules = new_rules
+        if save_rules(st.session_state.scanner_rules):
+            st.success(f"Rules saved. ({len(new_rules)} rows)")
+        else:
+            st.warning("Failed to save rules (see logs).")
+
+    if import_clicked:
+        imported = import_watchlist_as_rules()
+        if imported:
+            existing_syms = {str(r.get("symbol", "")).strip().upper() for r in st.session_state.scanner_rules if isinstance(r, dict)}
+            to_add = [r for r in imported if isinstance(r, dict) and str(r.get("symbol", "")).strip().upper() not in existing_syms]
+            if to_add:
+                st.session_state.scanner_rules = (st.session_state.scanner_rules or []) + to_add
+                st.success(f"Added {len(to_add)} new ticker(s) from watchlist.")
+                st.rerun()
             else:
-                st.info("No watchlist found or import failed.")
+                st.info("No new tickers to add from watchlist.")
+        else:
+            st.info("No watchlist found or import failed.")
 
     # Read-only sortable view of current rules (hidden unless toggled on)
     if st.session_state.get("show_rules_readonly", False) or st.session_state.get("show_rules_readonly_toggle", False):
