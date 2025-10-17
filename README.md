@@ -1,8 +1,8 @@
-# Options Yield Matrix v11
+# Options Yield Matrix v12
 
 A Streamlit web application designed to visualize and analyze options data, focusing on yield potential and probability of profit (POP) for option selling strategies (Puts and Calls). It fetches data from `marketdata.app` and `yfinance`, providing interactive filtering and display capabilities.
 
-This version defaults to using the cost-effective **cached data feed** from `marketdata.app` for options chains, with an option to fetch **live data** on demand for individual tickers during market hours.
+This version defaults to using the cost-effective **cached data feed** from `marketdata.app` for options chains, with an option to fetch **live data** on demand for individual tickers during market hours. Version 12 adds portfolio sizing controls to the Scanner, including AUD inputs, manual FX rate, allocation %, Supabase persistence, and new result columns for contracts and portfolio usage.
 
 ## Key Features
 
@@ -62,7 +62,7 @@ The app now includes a multipage "Scanner" that finds only those contracts meeti
 ### How to use
 
 1. Open the "Scanner" page from the sidebar.
-2. Set global scan window: Min/Max DTE, and optionally toggle "Top 1 per symbol".
+2. Set global scan window: Min/Max DTE. Configure **Portfolio Sizing** inputs (AUD amount, AUD→USD rate, % allocation) to drive contract and allocation calculations.
 3. In __Scanner Rules__, add/edit rows with:
    - `symbol` (e.g., SPY)
    - `desired_strike` (0 means ignore strike threshold)
@@ -70,7 +70,7 @@ The app now includes a multipage "Scanner" that finds only those contracts meeti
    - `strategy` (PUT or CALL)
 4. Click __Save Rules__ to persist to `scanner_rules.json` in project root.
 5. Optionally click __Import Watchlist__ to seed rules from `watchlist.json`.
-6. Click __Run Scan__. Matching contracts render in a table.
+6. Click __Run Scan__. Matching contracts render in a table with `Contracts` and `% Portfolio Used` columns derived from your sizing settings.
 7. Click __Download CSV__ to export results.
 
 ### Refreshing & Caching
@@ -83,6 +83,7 @@ The app now includes a multipage "Scanner" that finds only those contracts meeti
 - Reuses `matrix.build_matrix()` so monthly yield, POP, pricing method, and DTE match the main page exactly.
 - Fetches only the strategies you actually use per symbol (PUT and/or CALL) concurrently to reduce requests.
 - Rules are saved to `scanner_rules.json` at the project root; you can edit this file manually or via the UI.
+- Portfolio sizing preferences are stored in Supabase (`scanner_prefs`) with local fallback for offline usage.
 
 ## Requirements
 

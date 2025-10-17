@@ -295,6 +295,31 @@ async def _scan_once_async(rules: list[dict], min_dte: int, max_dte: int) -> tup
     if not matches_df.empty:
         matches_df.sort_values(by=["monthly_yield", "POP", "dte"], ascending=[False, False, True], inplace=True)
 
+    # Allocation calculations
+    portfolio_usd = st.session_state.get("portfolio_aud", 0.0) * st.session_state.get("aud_to_usd_rate", 0.0)
+    allocation_usd = portfolio_usd * (st.session_state.get("portfolio_percent", 0.0) / 100.0)
+
+    def _compute_contracts_from_strike(strike_val: float) -> int:
+        collateral = max(float(strike_val or 0.0) * 100.0, 0.0)
+        if collateral <= 0 or allocation_usd <= 0:
+            return 0
+        contracts = round(allocation_usd / collateral)
+        return max(contracts, 1)
+
+    def _compute_pct_used(strike_val: float, contracts: int) -> float:
+        collateral = max(float(strike_val or 0.0) * 100.0, 0.0)
+        if portfolio_usd <= 0 or collateral <= 0 or contracts <= 0:
+            return 0.0
+        used = (collateral * contracts) / portfolio_usd * 100.0
+        return max(0.0, used)
+
+    if not matches_df.empty:
+        matches_df["contracts_to_sell"] = matches_df.get("strike", 0.0).apply(_compute_contracts_from_strike)
+        matches_df["portfolio_pct_used"] = matches_df.apply(
+            lambda row: _compute_pct_used(row.get("strike", 0.0), row.get("contracts_to_sell", 0)),
+            axis=1
+        )
+
     # Build not-matched summary per rule at the actual desired strike
     # Cache fetched rows for each symbol/strategy from earlier gather
     rows_cache: dict[str, dict[str, list[dict]]] = {sym: rows_map for sym, rows_map in results}
@@ -403,6 +428,11 @@ async def _scan_once_async(rules: list[dict], min_dte: int, max_dte: int) -> tup
     misses_df = pd.DataFrame(misses) if misses else pd.DataFrame()
     if not misses_df.empty:
         misses_df.sort_values(by=["symbol", "monthly_yield", "POP", "dte"], ascending=[True, False, False, True], inplace=True)
+        misses_df["contracts_to_sell"] = misses_df.get("desired_strike", 0.0).apply(_compute_contracts_from_strike)
+        misses_df["portfolio_pct_used"] = misses_df.apply(
+            lambda row: _compute_pct_used(row.get("desired_strike", 0.0), row.get("contracts_to_sell", 0)),
+            axis=1
+        )
 
     return matches_df, misses_df
 
@@ -534,6 +564,28 @@ async def _refresh_matches_live(matches: pd.DataFrame, min_dte: int, max_dte: in
         return pd.DataFrame()
     df = pd.DataFrame(results)
     df.sort_values(by=["monthly_yield", "POP", "dte"], ascending=[False, False, True], inplace=True)
+    portfolio_usd = float(st.session_state.get("portfolio_aud", 0.0)) * float(st.session_state.get("aud_to_usd_rate", 0.0))
+    allocation_usd = portfolio_usd * (float(st.session_state.get("portfolio_percent", 0.0)) / 100.0)
+
+    def _contracts_from_strike(strike_val: float) -> int:
+        collateral = max(float(strike_val or 0.0) * 100.0, 0.0)
+        if collateral <= 0 or allocation_usd <= 0:
+            return 0
+        contracts = round(allocation_usd / collateral)
+        return max(contracts, 1)
+
+    def _pct_used(strike_val: float, contracts: int) -> float:
+        collateral = max(float(strike_val or 0.0) * 100.0, 0.0)
+        if portfolio_usd <= 0 or collateral <= 0 or contracts <= 0:
+            return 0.0
+        used = (collateral * contracts) / portfolio_usd * 100.0
+        return max(0.0, used)
+
+    df["contracts_to_sell"] = df.get("strike", 0.0).apply(_contracts_from_strike)
+    df["portfolio_pct_used"] = df.apply(
+        lambda row: _pct_used(row.get("strike", 0.0), row.get("contracts_to_sell", 0)),
+        axis=1
+    )
     return df
 
 # -----------------------------------------------------------------------------
@@ -557,16 +609,17 @@ except Exception:
     prefs = {}
 default_min_dte = int(prefs.get("min_dte", cfg.get("SCANNER_MIN_DTE", cfg.get("MIN_DTE", 2))))
 default_max_dte = int(prefs.get("max_dte", cfg.get("MAX_DTE", 60)))
-if "min_dte" not in st.session_state:
-    st.session_state.min_dte = default_min_dte
-if "max_dte" not in st.session_state:
-    st.session_state.max_dte = default_max_dte
+default_portfolio_aud = float(prefs.get("portfolio_aud", 490000.0))
+default_fx_rate = float(prefs.get("aud_to_usd_rate", 0.65))
+default_portfolio_percent = float(prefs.get("portfolio_percent", 10.0))
+
 col_a, col_b = st.columns(2)
 with col_a:
     min_dte = st.number_input(
         "Min DTE",
         min_value=0,
         max_value=365,
+        value=st.session_state.get("min_dte", default_min_dte),
         key="min_dte",
         help="Default comes from SCANNER_MIN_DTE if set, else MIN_DTE."
     )
@@ -575,16 +628,60 @@ with col_b:
         "Max DTE",
         min_value=0,
         max_value=730,
+        value=st.session_state.get("max_dte", default_max_dte),
         key="max_dte"
     )
 
-# Save current DTE values as preset (Supabase with local fallback)
+# Portfolio inputs
+pcol1, pcol2, pcol3 = st.columns(3)
+with pcol1:
+    portfolio_aud = st.number_input(
+        "Portfolio (AUD)",
+        min_value=0.0,
+        step=1000.0,
+        value=float(st.session_state.get("portfolio_aud", default_portfolio_aud)),
+        key="portfolio_aud"
+    )
+with pcol2:
+    aud_to_usd_rate = st.number_input(
+        "AUD → USD rate",
+        min_value=0.0,
+        step=0.01,
+        value=float(st.session_state.get("aud_to_usd_rate", default_fx_rate)),
+        format="%.4f",
+        key="aud_to_usd_rate"
+    )
+with pcol3:
+    portfolio_percent = st.number_input(
+        "% of Portfolio",
+        min_value=0.0,
+        max_value=100.0,
+        step=0.5,
+        value=float(st.session_state.get("portfolio_percent", default_portfolio_percent)),
+        key="portfolio_percent"
+    )
+
+portfolio_usd = float(st.session_state.portfolio_aud) * float(st.session_state.aud_to_usd_rate)
+allocation_usd = portfolio_usd * (float(st.session_state.portfolio_percent) / 100.0)
+st.caption(
+    f"Portfolio USD: ${portfolio_usd:,.2f}"
+)
+
+# Save current scanner settings as preset (Supabase with local fallback)
 sp_col1, sp_col2 = st.columns([1, 3])
 with sp_col1:
-    if st.button("💾 Save Preset (DTE)"):
-        ok = save_prefs({"min_dte": int(st.session_state.min_dte), "max_dte": int(st.session_state.max_dte)})
+    if st.button("💾 Save Preset (Scanner Settings)"):
+        ok = save_prefs(
+            {
+                "min_dte": int(st.session_state.min_dte),
+                "max_dte": int(st.session_state.max_dte),
+                "portfolio_aud": float(st.session_state.portfolio_aud),
+                "aud_to_usd_rate": float(st.session_state.aud_to_usd_rate),
+                "portfolio_percent": float(st.session_state.portfolio_percent),
+            }
+        )
         if ok:
-            st.success("Scanner DTE preset saved.")
+            st.success("Scanner settings saved.")
         else:
             st.warning("Failed to save preset (see logs). Using local fallback if available.")
 
@@ -850,6 +947,8 @@ if "results_df" not in st.session_state:
     st.session_state.results_df = pd.DataFrame()
 if "misses_df" not in st.session_state:
     st.session_state.misses_df = pd.DataFrame()
+if "live_df" not in st.session_state:
+    st.session_state.live_df = None
 
 matches_df = pd.DataFrame()
 misses_df = pd.DataFrame()
@@ -874,6 +973,7 @@ if run_scan:
     # Persist results for UI reruns
     st.session_state.results_df = matches_df.copy()
     st.session_state.misses_df = misses_df.copy()
+    st.session_state.live_df = None
 else:
     # Use last results so toggles (which cause reruns) don't clear the table
     matches_df = st.session_state.get("results_df", pd.DataFrame())
@@ -896,9 +996,11 @@ if not matches_df.empty:
             except Exception as e:
                 st.error(f"Live refresh error: {e}")
                 live_df = pd.DataFrame()
+            else:
+                st.session_state.live_df = live_df.copy() if isinstance(live_df, pd.DataFrame) else None
 
     # Ensure live_df is defined across reruns
-    live_df = st.session_state.get("live_df", None)
+    live_df = st.session_state.get("live_df", None) if (live_df is None or live_df.empty) else live_df
     display_df = live_df if (live_df is not None and not live_df.empty) else matches_df
     st.subheader("Matches (Live)" if live_df is not None else "Matches")
 
@@ -915,6 +1017,8 @@ if not matches_df.empty:
         "POP": st.column_config.NumberColumn("POP %", format="%.1f"),
         "iv(%)": st.column_config.NumberColumn("IV %", format="%.1f"),
         "premium($)": st.column_config.NumberColumn("Premium $", format="%.2f"),
+        "contracts_to_sell": st.column_config.NumberColumn("Contracts", format="%d"),
+        "portfolio_pct_used": st.column_config.NumberColumn("% Portfolio Used", format="%.2f"),
         "breakeven_%": st.column_config.NumberColumn("Breakeven %", format="%.2f"),
         "breakeven": st.column_config.NumberColumn("Breakeven $", format="%.2f"),
         "price_used": st.column_config.NumberColumn("Price Used $", format="%.2f"),
@@ -925,7 +1029,7 @@ if not matches_df.empty:
     # Reorder columns for clarity
     desired_cols = [
         "strategy", "expiry", "dte", "strike",
-        "monthly_yield", "POP", "premium($)", "iv(%)",
+        "monthly_yield", "POP", "premium($)", "contracts_to_sell", "portfolio_pct_used", "iv(%)",
         "breakeven", "breakeven_%", "price_used", "method",
     ]
     existing_cols = [c for c in desired_cols if c in display_df.columns]
@@ -948,16 +1052,19 @@ if not matches_df.empty:
                         with t:
                             view = sub[sub.get("strategy", "PUT") == strat]
                             if existing_cols:
-                                view = view[["symbol"] + existing_cols] if "symbol" in view.columns else view[existing_cols]
+                                cols_to_show = ["symbol"] + existing_cols if "symbol" in view.columns else existing_cols
+                                view = view[cols_to_show]
                             st.dataframe(view, use_container_width=True, hide_index=True, column_config=colcfg)
                 else:
                     view = sub
                     if existing_cols:
-                        view = view[["symbol"] + existing_cols] if "symbol" in view.columns else view[existing_cols]
+                        cols_to_show = ["symbol"] + existing_cols if "symbol" in view.columns else existing_cols
+                        view = view[cols_to_show]
                     st.dataframe(view, use_container_width=True, hide_index=True, column_config=colcfg)
 
     # Full CSV download of current display set
-    csv = display_df.sort_values(by=["symbol", "monthly_yield", "POP", "dte"], ascending=[True, False, False, True]).to_csv(index=False).encode("utf-8")
+    csv_cols = [c for c in ["symbol"] + desired_cols if c in display_df.columns]
+    csv = display_df.sort_values(by=["symbol", "monthly_yield", "POP", "dte"], ascending=[True, False, False, True])[csv_cols].to_csv(index=False).encode("utf-8")
     st.download_button(
         "⬇️ Download CSV",
         data=csv,
@@ -974,6 +1081,8 @@ if not matches_df.empty:
             "POP": st.column_config.NumberColumn("POP %", format="%.1f"),
             "iv(%)": st.column_config.NumberColumn("IV %", format="%.1f"),
             "premium($)": st.column_config.NumberColumn("Premium $", format="%.2f"),
+            "contracts_to_sell": st.column_config.NumberColumn("Contracts", format="%d"),
+            "portfolio_pct_used": st.column_config.NumberColumn("% Portfolio Used", format="%.2f"),
             "breakeven_%": st.column_config.NumberColumn("Breakeven %", format="%.2f"),
             "breakeven": st.column_config.NumberColumn("Breakeven $", format="%.2f"),
             "price_used": st.column_config.NumberColumn("Price Used $", format="%.2f"),
@@ -982,7 +1091,7 @@ if not matches_df.empty:
         }
         desired_cols2 = [
             "strategy", "expiry", "dte", "desired_strike",
-            "monthly_yield", "min_monthly_yield", "POP", "premium($)", "iv(%)",
+            "monthly_yield", "min_monthly_yield", "POP", "premium($)", "contracts_to_sell", "portfolio_pct_used", "iv(%)",
             "breakeven", "breakeven_%", "price_used", "method",
         ]
         exists2 = [c for c in desired_cols2 if c in misses_df.columns]
@@ -994,78 +1103,10 @@ if not matches_df.empty:
             n_expand_all = st.checkbox("Expand all", value=(misses_df["symbol"].nunique() == 1), disabled=not n_grouped_view, key="misses_expand_all")
 
         if not n_grouped_view:
-            view2 = misses_df.copy().sort_values(by=["symbol", "monthly_yield", "POP", "dte"], ascending=[True, False, False, True])
-            if exists2:
-                view2 = view2[["symbol"] + exists2] if "symbol" in view2.columns else view2[exists2]
-            st.dataframe(view2, use_container_width=True, hide_index=True, column_config=n_colcfg)
-        else:
-            for sym in sorted(misses_df["symbol"].unique()):
-                sub = misses_df[misses_df["symbol"] == sym].copy()
-                sub = sub.sort_values(by=["monthly_yield", "POP", "dte"], ascending=[False, False, True])
-                expander = st.expander(f"{sym} • {len(sub)} candidates", expanded=n_expand_all)
-                with expander:
-                    strategies = [s for s in ["PUT", "CALL"] if s in set(sub.get("strategy", "PUT"))] or ["PUT"]
-                    if len(strategies) > 1:
-                        tabs = st.tabs(strategies)
-                        for t, strat in zip(tabs, strategies):
-                            with t:
-                                v = sub[sub.get("strategy", "PUT") == strat]
-                                if exists2:
-                                    v = v[["symbol"] + exists2] if "symbol" in v.columns else v[exists2]
-                                st.dataframe(v, use_container_width=True, hide_index=True, column_config=n_colcfg)
-                    else:
-                        v = sub
-                        if exists2:
-                            v = v[["symbol"] + exists2] if "symbol" in v.columns else v[exists2]
-                        st.dataframe(v, use_container_width=True, hide_index=True, column_config=n_colcfg)
-
-        # CSV download for Not Matched (flat)
-        csv2 = misses_df.sort_values(by=["symbol", "monthly_yield", "POP", "dte"], ascending=[True, False, False, True]).to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "⬇️ Download Not-Matched CSV",
-            data=csv2,
-            file_name="scanner_not_matched.csv",
-            mime="text/csv",
-        )
-    else:
-        st.info("No unmatched tickers to show.")
-else:
-    # Even if no matches, show Not Matched if available
-    if misses_df is not None and not misses_df.empty:
-        st.subheader("Not Matched")
-        n_colcfg = {
-            "monthly_yield": st.column_config.NumberColumn("Monthly Yield %", format="%.2f"),
-            "min_monthly_yield": st.column_config.NumberColumn("Min Monthly Yield %", format="%.2f"),
-            "POP": st.column_config.NumberColumn("POP %", format="%.1f"),
-            "iv(%)": st.column_config.NumberColumn("IV %", format="%.1f"),
-            "premium($)": st.column_config.NumberColumn("Premium $", format="%.2f"),
-            "breakeven_%": st.column_config.NumberColumn("Breakeven %", format="%.2f"),
-            "breakeven": st.column_config.NumberColumn("Breakeven $", format="%.2f"),
-            "price_used": st.column_config.NumberColumn("Price Used $", format="%.2f"),
-            "dte": st.column_config.NumberColumn("DTE", format="%d"),
-            "desired_strike": st.column_config.NumberColumn("Desired Strike", format="%.2f"),
-        }
-        desired_cols2 = [
-            "strategy", "expiry", "dte", "desired_strike",
-            "monthly_yield", "min_monthly_yield", "POP", "premium($)", "iv(%)",
-            "breakeven", "breakeven_%", "price_used", "method",
-        ]
-        exists2 = []
-        try:
-            exists2 = [c for c in desired_cols2 if c in misses_df.columns]
-        except Exception:
-            exists2 = []
-        # Toggle grouped view similar to Matches
-        ng1, ng2 = st.columns([1.5, 1])
-        with ng1:
-            n_grouped_view = st.checkbox("Group by ticker (expand/collapse)", value=True, key="misses_grouped_view_nomatch")
-        with ng2:
-            n_expand_all = st.checkbox("Expand all", value=(misses_df["symbol"].nunique() == 1), disabled=not n_grouped_view, key="misses_expand_all_nomatch")
-
-        if not n_grouped_view:
             view2 = misses_df.copy().sort_values(by=["symbol", "monthly_yield", "POP", "dte"], ascending=[True, False, False, True]) if isinstance(misses_df, pd.DataFrame) else pd.DataFrame()
             if isinstance(view2, pd.DataFrame) and not view2.empty and exists2:
-                view2 = view2[["symbol"] + exists2] if "symbol" in view2.columns else view2[exists2]
+                cols_to_show = ["symbol"] + exists2 if "symbol" in view2.columns else exists2
+                view2 = view2[cols_to_show]
             if isinstance(view2, pd.DataFrame) and not view2.empty:
                 st.dataframe(view2, use_container_width=True, hide_index=True, column_config=n_colcfg)
         else:
@@ -1082,17 +1123,94 @@ else:
                                 with t:
                                     v = sub[sub.get("strategy", "PUT") == strat]
                                     if exists2:
-                                        v = v[["symbol"] + exists2] if "symbol" in v.columns else v[exists2]
+                                        cols_to_show = ["symbol"] + exists2 if "symbol" in v.columns else exists2
+                                        v = v[cols_to_show]
                                     st.dataframe(v, use_container_width=True, hide_index=True, column_config=n_colcfg)
                         else:
                             v = sub
                             if exists2:
-                                v = v[["symbol"] + exists2] if "symbol" in v.columns else v[exists2]
+                                cols_to_show = ["symbol"] + exists2 if "symbol" in v.columns else exists2
+                                v = v[cols_to_show]
                             st.dataframe(v, use_container_width=True, hide_index=True, column_config=n_colcfg)
 
         # CSV download for Not Matched (flat)
         if isinstance(misses_df, pd.DataFrame) and not misses_df.empty:
-            csv2 = misses_df.sort_values(by=["symbol", "monthly_yield", "POP", "dte"], ascending=[True, False, False, True]).to_csv(index=False).encode("utf-8")
+            csv2_cols = [c for c in ["symbol"] + desired_cols2 if c in misses_df.columns]
+            csv2 = misses_df.sort_values(by=["symbol", "monthly_yield", "POP", "dte"], ascending=[True, False, False, True])[csv2_cols].to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇️ Download Not-Matched CSV",
+                data=csv2,
+                file_name="scanner_not_matched.csv",
+                mime="text/csv",
+            )
+    else:
+        st.info("No unmatched tickers to show.")
+else:
+    # Even if no matches, show Not Matched if available
+    if misses_df is not None and not misses_df.empty:
+        st.subheader("Not Matched")
+        n_colcfg = {
+            "monthly_yield": st.column_config.NumberColumn("Monthly Yield %", format="%.2f"),
+            "min_monthly_yield": st.column_config.NumberColumn("Min Monthly Yield %", format="%.2f"),
+            "POP": st.column_config.NumberColumn("POP %", format="%.1f"),
+            "iv(%)": st.column_config.NumberColumn("IV %", format="%.1f"),
+            "premium($)": st.column_config.NumberColumn("Premium $", format="%.2f"),
+            "contracts_to_sell": st.column_config.NumberColumn("Contracts", format="%d"),
+            "portfolio_pct_used": st.column_config.NumberColumn("% Portfolio Used", format="%.2f"),
+            "breakeven_%": st.column_config.NumberColumn("Breakeven %", format="%.2f"),
+            "breakeven": st.column_config.NumberColumn("Breakeven $", format="%.2f"),
+            "price_used": st.column_config.NumberColumn("Price Used $", format="%.2f"),
+            "dte": st.column_config.NumberColumn("DTE", format="%d"),
+            "desired_strike": st.column_config.NumberColumn("Desired Strike", format="%.2f"),
+        }
+        desired_cols2 = [
+            "strategy", "expiry", "dte", "desired_strike",
+            "monthly_yield", "min_monthly_yield", "POP", "premium($)", "contracts_to_sell", "portfolio_pct_used", "iv(%)",
+            "breakeven", "breakeven_%", "price_used", "method",
+        ]
+        exists2 = [c for c in desired_cols2 if c in misses_df.columns]
+        # Toggle grouped view similar to Matches
+        ng1, ng2 = st.columns([1.5, 1])
+        with ng1:
+            n_grouped_view = st.checkbox("Group by ticker (expand/collapse)", value=True, key="misses_grouped_view_nomatch")
+        with ng2:
+            n_expand_all = st.checkbox("Expand all", value=(misses_df["symbol"].nunique() == 1), disabled=not n_grouped_view, key="misses_expand_all_nomatch")
+
+        if not n_grouped_view:
+            view2 = misses_df.copy().sort_values(by=["symbol", "monthly_yield", "POP", "dte"], ascending=[True, False, False, True]) if isinstance(misses_df, pd.DataFrame) else pd.DataFrame()
+            if isinstance(view2, pd.DataFrame) and not view2.empty and exists2:
+                cols_to_show = ["symbol"] + exists2 if "symbol" in view2.columns else exists2
+                view2 = view2[cols_to_show]
+            if isinstance(view2, pd.DataFrame) and not view2.empty:
+                st.dataframe(view2, use_container_width=True, hide_index=True, column_config=n_colcfg)
+        else:
+            if isinstance(misses_df, pd.DataFrame) and not misses_df.empty:
+                for sym in sorted(misses_df["symbol"].unique()):
+                    sub = misses_df[misses_df["symbol"] == sym].copy()
+                    sub = sub.sort_values(by=["monthly_yield", "POP", "dte"], ascending=[False, False, True])
+                    expander = st.expander(f"{sym} • {len(sub)} candidates", expanded=n_expand_all)
+                    with expander:
+                        strategies = [s for s in ["PUT", "CALL"] if s in set(sub.get("strategy", "PUT"))] or ["PUT"]
+                        if len(strategies) > 1:
+                            tabs = st.tabs(strategies)
+                            for t, strat in zip(tabs, strategies):
+                                with t:
+                                    v = sub[sub.get("strategy", "PUT") == strat]
+                                    if exists2:
+                                        cols_to_show = ["symbol"] + exists2 if "symbol" in v.columns else exists2
+                                        v = v[cols_to_show]
+                                    st.dataframe(v, use_container_width=True, hide_index=True, column_config=n_colcfg)
+                        else:
+                            v = sub
+                            if exists2:
+                                cols_to_show = ["symbol"] + exists2 if "symbol" in v.columns else exists2
+                                v = v[cols_to_show]
+                            st.dataframe(v, use_container_width=True, hide_index=True, column_config=n_colcfg)
+
+        # CSV download for Not Matched (flat)
+        if isinstance(misses_df, pd.DataFrame) and not misses_df.empty:
+            csv2_cols = [c for c in ["symbol"] + desired_cols2 if c in misses_df.columns]
+            csv2 = misses_df.sort_values(by=["symbol", "monthly_yield", "POP", "dte"], ascending=[True, False, False, True])[csv2_cols].to_csv(index=False).encode("utf-8")
             st.download_button(
                 "⬇️ Download Not-Matched CSV",
                 data=csv2,
